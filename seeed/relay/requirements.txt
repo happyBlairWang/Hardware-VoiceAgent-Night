@@ -1,0 +1,5 @@
+websockets>=14
+sounddevice
+numpy
+requests
+pyserial

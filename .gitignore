@@ -1,0 +1,20 @@
+# secrets - never commit
+src/secrets.h
+relay/.env
+
+# build output
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# a virtualenv was vendored into this tree by an earlier project
+seeed/relay/.venv/
+
+# runtime data: conversation transcripts and recordings.
+# These hold real speech, including a child's. Keep them local.
+relay/session.jsonl
+relay/tests.jsonl
+seeed/notes/*.wav
+seeed/notes/*.md
+*.blend1

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Start the vintage phone relay, replacing one already running.
+#   ./phone          run in this terminal (Ctrl-C stops it)
+#   ./phone bg       run detached, logging to /tmp/relay.log
+cd "$(dirname "$0")/relay" || exit 1
+pkill -f "relay.py" 2>/dev/null && sleep 1
+if [ "$1" = "bg" ]; then
+  nohup "$HOME/esp-tools/bin/python" -u relay.py > /tmp/relay.log 2>&1 &
+  sleep 4
+  echo "relay running in background  ·  log: tail -f /tmp/relay.log"
+  grep -E "profile|volume|listening" /tmp/relay.log | tail -3
+else
+  exec "$HOME/esp-tools/bin/python" -u relay.py
+fi

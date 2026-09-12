@@ -66,6 +66,23 @@ button:focus-visible{outline:2px solid var(--brass);outline-offset:2px}
 /* volume */
 input[type=range]{width:100%;accent-color:var(--brass)}
 
+/* segmented source switch */
+.seg{display:flex;margin-bottom:14px;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.seg button{flex:1;border:0;border-radius:0;background:var(--sunk);padding:9px 6px;font-size:11.5px}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:#2A2010;color:var(--brass)}
+.seg button:hover:not(.on):not(:disabled){color:var(--brass)}
+
+/* segmented switches */
+.seg{display:flex;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.seg button{flex:1;border:0;border-radius:0;background:var(--sunk);color:var(--faint);
+  padding:10px 6px;font-size:11px}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button:hover:not(.on):not(:disabled){color:var(--dim)}
+.seg button.on{background:#20303B;color:var(--brass)}
+.hint{font-family:"IBM Plex Mono",monospace;font-size:10.5px;line-height:1.6;
+  color:var(--faint);margin:9px 0 0}
+
 /* tabs */
 .tabs{display:flex;gap:4px}
 .tab{font-family:"Oswald",sans-serif;text-transform:uppercase;letter-spacing:.08em;
@@ -148,6 +165,10 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
 <aside>
   <div class="blk">
     <h2>Microphone</h2>
+    <div class="seg" id="mic-seg">
+      <button class="on" data-mic="phone">Phone</button>
+      <button data-mic="mac">Mac</button>
+    </div>
     <div class="meter">
       <div class="mrow"><span class="mlab" id="mic-lab">Level</span><span class="mval" id="mic-val">—</span></div>
       <div class="bars" id="bars"></div>
@@ -164,6 +185,24 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
       <span class="mlab">Volume</span><span class="mval" id="vol-val">50%</span>
     </div>
     <input type="range" id="vol" min="0" max="100" value="50">
+  </div>
+
+  <div class="blk">
+    <h2>Where the voice comes out</h2>
+    <div class="seg" id="seg-out">
+      <button data-out="phone" class="on">Phone speaker</button>
+      <button data-out="mac">Mac speakers</button>
+    </div>
+  </div>
+
+  <div class="blk">
+    <h2>Echo control</h2>
+    <div class="seg" id="seg-gate">
+      <button data-gate="1" class="on">Mute mic</button>
+      <button data-gate="0">Turn detection</button>
+    </div>
+    <p class="hint" id="gate-hint">Microphone is held shut while the agent
+      speaks. Reliable, but no interrupting.</p>
   </div>
 
   <div class="blk">
@@ -263,6 +302,25 @@ function send(cmd, extra = {}) {
 
 document.querySelectorAll('button[data-cmd]').forEach(b =>
   b.addEventListener('click', () => send(b.dataset.cmd)));
+
+document.querySelectorAll('#seg-out button').forEach(b =>
+  b.addEventListener('click', () => send('output', { value: b.dataset.out })));
+
+document.querySelectorAll('#seg-gate button').forEach(b =>
+  b.addEventListener('click', () => send('gate', { value: b.dataset.gate === '1' })));
+
+const GATE_HINT = {
+  on: 'Microphone is held shut while the agent speaks. Reliable, but no interrupting.',
+  off: 'Mic stays open; the server decides when your turn ends. Barge-in works, '
+     + 'but the agent may hear itself through the speaker.',
+};
+
+function seg(sel, match) {
+  document.querySelectorAll(sel).forEach(b => b.classList.toggle('on', match(b)));
+}
+
+document.querySelectorAll('#mic-seg button').forEach(b =>
+  b.addEventListener('click', () => send('mic', { value: b.dataset.mic })));
 
 $('vol').addEventListener('input', e => {
   const v = +e.target.value;
@@ -388,12 +446,25 @@ function connect() {
       $('f-gate').textContent = deaf ? 'mic held shut — operator speaking' : '';
       document.querySelectorAll('button[data-cmd]').forEach(b =>
         b.disabled = !m.esp && b.dataset.cmd !== 'clear');
+      document.querySelectorAll('#seg-gate button').forEach(b => b.disabled = !m.esp);
 
       if (m.type === 'stats') {
         $('s-turns').textContent = m.turns ?? 0;
         $('s-sent').textContent = (m.sent_s ?? 0).toFixed(0) + 's';
         $('s-echo').textContent = (m.echo_s ?? 0).toFixed(0) + 's';
         $('s-voice').textContent = m.voice ?? '—';
+        if (m.mic) {
+          document.querySelectorAll('#mic-seg button').forEach(b =>
+            b.classList.toggle('on', b.dataset.mic === m.mic));
+          $('mic-lab').textContent = m.mic === 'mac' ? 'Level · Mac mic'
+                                                     : 'Level · MAX9814';
+        }
+        if (m.to_phone !== undefined)
+          seg('#seg-out button', b => b.dataset.out === (m.to_phone ? 'phone' : 'mac'));
+        if (m.gate !== undefined) {
+          seg('#seg-gate button', b => (b.dataset.gate === '1') === !!m.gate);
+          $('gate-hint').textContent = m.gate ? GATE_HINT.on : GATE_HINT.off;
+        }
         $('f-profile').textContent = `profile ${m.profile} · voice ${m.voice}`;
         const ms = ((m.queued ?? 0) / 8000) * 1000;
         $('q-val').textContent = Math.round(ms) + ' ms';

@@ -138,7 +138,20 @@ SESSION = {
         "system_prompt": _p["system_prompt"],
         "greeting": _p["greeting"],
         "tools": TOOLS,
-        "input":  {"format": {"encoding": "audio/pcm", "sample_rate": RATE}},
+        # Verified live: voice_focus takes "near-field"/"far-field", NOT a
+        # boolean. near-field suits a handset held to the mouth. turn_detection
+        # also carries undocumented "type" and "interruption_delay" fields.
+        "input": {
+            "format": {"encoding": "audio/pcm", "sample_rate": RATE},
+            "voice_focus": "near-field",
+            "voice_focus_threshold": 0.5,
+            "turn_detection": {
+                "vad_threshold": 0.5,
+                "min_silence": 900,     # children trail off mid-sentence
+                "max_silence": 3000,
+                "interrupt_response": True,
+            },
+        },
         "output": {"voice": VOICE,
                    "format": {"encoding": "audio/pcm", "sample_rate": RATE}},
     },
@@ -166,7 +179,21 @@ state = {"esp": False, "agent": False, "muted": False}
 # Everything the dashboard can see or change while running.
 esp_ws  = None                      # the phone's socket, when it is connected
 capture = None                      # collects mic audio during an echo test
-runtime = {"vol": PHONE_VOL}
+runtime = {"vol": PHONE_VOL, "to_phone": TO_PHONE, "gate": True,
+           "mic": "phone"}          # "phone" = MAX9814, "mac" = built-in
+
+# The Mac's microphone, as a fallback source. The stream always runs; the
+# callback only queues audio while that source is selected, so switching is
+# instant and does not need the device re-opened.
+mic_q: "queue.Queue[bytes]" = queue.Queue(maxsize=120)
+
+def on_mac_mic(indata, frames, time_info, status):
+    if runtime["mic"] != "mac":
+        return
+    try:
+        mic_q.put_nowait(bytes(indata))
+    except queue.Full:
+        pass
 stats   = {"sent_s": 0.0, "echo_s": 0.0, "turns": 0, "rms": 0.0, "queued": 0}
 
 
@@ -256,7 +283,9 @@ async def telemetry():
         await asyncio.sleep(0.3)
         if ui_clients:
             await to_ui({"type": "stats", **stats, **state,
-                         "vol": runtime["vol"], "profile": PROFILE, "voice": VOICE})
+                         "vol": runtime["vol"], "profile": PROFILE, "voice": VOICE,
+                         "to_phone": runtime["to_phone"], "gate": runtime["gate"],
+                         "mic": runtime["mic"]})
 
 async def to_ui(msg: dict):
     if not ui_clients:
@@ -297,6 +326,10 @@ def load_key() -> str:
 async def handle_phone(esp):
     global esp_ws
     esp_ws = esp
+    # The device tells us what it wants; nothing to keep in sync by hand.
+    #   "fmt:u8@8000"      HW-104 on the 8-bit DAC  -> decimate + convert
+    #   "fmt:pcm16@24000"  NS4168 over I2S          -> pass 16-bit straight through
+    fmt = {"bits": 8, "rate": 8000}
     state["esp"] = True
     await push_status()
     print(f"\n=== phone connected from {esp.remote_address[0]} ===", flush=True)
@@ -319,10 +352,24 @@ async def handle_phone(esp):
                 n = 0
                 was_muted = None
                 async for frame in esp:
-                    if not isinstance(frame, bytes) or not frame:
+                    if isinstance(frame, str):
+                        if frame.startswith("fmt:"):
+                            spec = frame[4:]
+                            enc, _, rate = spec.partition("@")
+                            fmt["bits"] = 16 if enc == "pcm16" else 8
+                            fmt["rate"] = int(rate or 8000)
+                            print(f"  [fmt] phone wants {enc} @ {fmt['rate']} Hz",
+                                  flush=True)
+                            await to_ui({"type": "note",
+                                         "text": f"speaker format: {enc} @ {fmt['rate']} Hz"})
                         continue
+                    if not frame:
+                        continue
+                    if runtime["mic"] != "phone":
+                        continue                      # Mac mic has the floor
 
-                    gated = time.monotonic() < speak_until + TAIL_S
+                    gated = (runtime["gate"]
+                             and time.monotonic() < speak_until + TAIL_S)
                     if gated != was_muted:
                         was_muted = gated
                         state["muted"] = gated
@@ -349,6 +396,32 @@ async def handle_phone(esp):
                     if n % 5 == 0:
                         await to_ui({"type": "level", "rms": stats["rms"]})
 
+            async def mac_to_agent():
+                """Same job as esp_to_agent, but sourced from the laptop. Uses
+                the relay-side gate, since the device gate only governs the
+                ESP32's own microphone."""
+                nonlocal sent, dropped
+                await ready.wait()
+                loop = asyncio.get_running_loop()
+                while True:
+                    frame = await loop.run_in_executor(None, mic_q.get)
+                    if runtime["mic"] != "mac":
+                        continue
+                    if runtime["gate"] and time.monotonic() < speak_until + TAIL_S:
+                        dropped += len(frame)
+                        stats["echo_s"] = dropped / 2 / RATE
+                        state["muted"] = True
+                        continue
+                    state["muted"] = False
+                    a = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+                    stats["rms"] = min(float(np.sqrt((a * a).mean())) / 6000.0, 1.0)
+                    sent += len(frame)
+                    stats["sent_s"] = sent / 2 / RATE
+                    await agent.send(json.dumps({
+                        "type": "input.audio",
+                        "audio": base64.b64encode(frame).decode(),
+                    }))
+
             async def agent_to_out():
                 nonlocal speak_until
                 async for raw in agent:
@@ -357,16 +430,22 @@ async def handle_phone(esp):
 
                     if t == "reply.audio":
                         pcm = base64.b64decode(m["data"])
-                        if TO_PHONE:
-                            # 24 kHz 16-bit  ->  8 kHz 8-bit unsigned.
-                            # Averaging each group of three avoids the aliasing
-                            # that plain decimation would fold into the voice.
+                        if runtime["to_phone"]:
                             a = np.frombuffer(pcm, dtype=np.int16)
-                            k = (len(a) // 3) * 3
-                            if k:
-                                d = a[:k].reshape(-1, 3).mean(axis=1)
-                                u8 = (d / 256 * runtime["vol"] + 128).clip(0, 255).astype(np.uint8)
-                                await esp.send(u8.tobytes())
+                            if fmt["bits"] == 16:
+                                # NS4168 over I2S: the agent already speaks
+                                # 24 kHz 16-bit, so only the level changes.
+                                out = (a * runtime["vol"]).clip(-32768, 32767)
+                                await esp.send(out.astype(np.int16).tobytes())
+                            else:
+                                # 24 kHz 16-bit -> 8 kHz 8-bit unsigned for the
+                                # built-in DAC. Averaging each group of three
+                                # avoids the aliasing plain decimation folds in.
+                                k = (len(a) // 3) * 3
+                                if k:
+                                    d = a[:k].reshape(-1, 3).mean(axis=1)
+                                    u8 = (d / 256 * runtime["vol"] + 128).clip(0, 255)
+                                    await esp.send(u8.astype(np.uint8).tobytes())
                         else:
                             spk_q.put(pcm)
                         # extend the quiet window by this chunk's real duration
@@ -398,7 +477,7 @@ async def handle_phone(esp):
                         while not spk_q.empty():
                             spk_q.get_nowait()
                         _tail.clear()
-                        if TO_PHONE:
+                        if runtime["to_phone"]:
                             await esp.send("flush")     # drop stale audio on the phone
                         speak_until = time.monotonic()
                     elif t == "tool.call":
@@ -415,7 +494,7 @@ async def handle_phone(esp):
                                      "text": f"agent error: {m.get('code')}"})
 
             try:
-                await asyncio.gather(esp_to_agent(), agent_to_out())
+                await asyncio.gather(esp_to_agent(), mac_to_agent(), agent_to_out())
             except websockets.ConnectionClosed:
                 pass
             finally:
@@ -454,8 +533,40 @@ async def handle_ui(ws):
                 record_test("sweep", ok, f"200 Hz -> 3 kHz at {v:.0%}")
             elif c == "echo":
                 asyncio.create_task(echo_test())
+            elif c == "mic":
+                v2 = m.get("value")
+                if v2 in ("phone", "mac"):
+                    runtime["mic"] = v2
+                    while not mic_q.empty():
+                        mic_q.get_nowait()
+                    label = "MAX9814 on the phone" if v2 == "phone" else "the Mac's mic"
+                    print(f"  [mic] source -> {v2}", flush=True)
+                    await to_ui({"type": "note", "text": f"listening through {label}"})
             elif c == "volume":
                 runtime["vol"] = max(0.0, min(1.0, float(m.get("value", 0.5))))
+            elif c == "output":
+                runtime["to_phone"] = (m.get("value") == "phone")
+                where = "phone speaker" if runtime["to_phone"] else "Mac speakers"
+                if not runtime["to_phone"] and esp_ws is not None:
+                    try:
+                        await esp_ws.send("flush")
+                    except Exception:
+                        pass
+                print(f"  [out] -> {where}", flush=True)
+                await to_ui({"type": "note", "text": f"output -> {where}"})
+                record_test("output route", True, where)
+            elif c == "gate":
+                runtime["gate"] = bool(m.get("value"))
+                mode = ("mic muted while speaking" if runtime["gate"]
+                        else "server turn detection only")
+                if esp_ws is not None:
+                    try:
+                        await esp_ws.send("gate:on" if runtime["gate"] else "gate:off")
+                    except Exception:
+                        pass
+                print(f"  [gate] {mode}", flush=True)
+                await to_ui({"type": "note", "text": f"echo control: {mode}"})
+                record_test("echo mode", True, mode)
             elif c == "clear":
                 await to_ui({"type": "clear"})
     finally:
@@ -505,6 +616,15 @@ def serve_page():
 async def main():
     load_key()
     threading.Thread(target=serve_page, daemon=True).start()
+    try:
+        mac_in = sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                                blocksize=1200, callback=on_mac_mic)
+        mac_in.start()
+        mac_ok = True
+    except Exception as e:
+        mac_in, mac_ok = None, False
+        print(f"mac mic unavailable ({e}) - phone mic only", flush=True)
+
     with sd.OutputStream(samplerate=RATE, channels=1, dtype="int16",
                          blocksize=1200, callback=on_speaker):
         asyncio.create_task(telemetry())
@@ -517,6 +637,10 @@ async def main():
             print(f"volume {PHONE_VOL:.0%}", flush=True)
             print(f"audio  output -> "
                   f"{'ESP32 speaker' if TO_PHONE else 'Mac speakers'}", flush=True)
+            print("turn   detection on (vad 0.5, silence 900-3000 ms), "
+                  "voice focus near-field", flush=True)
+            print(f"mic    source '{runtime['mic']}'"
+                  f"{'' if mac_ok else '  (mac mic unavailable)'}", flush=True)
             await asyncio.Future()
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ M = {
     "pcb_mic":  mat("pcb_mic",  (0.13, 0.35, 0.24)),
     "pcb_amp":  mat("pcb_amp",  (0.16, 0.28, 0.45)),
     "pad":      mat("pad",      (0.72, 0.55, 0.20), 0.35),
+    "pad_off":  mat("pad_off",  (0.55, 0.57, 0.58), 0.75),
     "ink":      mat("ink",      (0.05, 0.09, 0.13), 0.9),
     "ink_hi":   mat("ink_hi",   (0.96, 0.97, 0.98), 0.9),
     "dim":      mat("dim",      (0.34, 0.40, 0.47), 0.9),
@@ -45,12 +46,12 @@ def board(name, loc, size, material, z=0.18):
     bpy.ops.object.shade_smooth_by_angle()
     return o
 
-def pad(loc, label=None, material="pad", r=0.16, above=False):
+def pad(loc, label=None, material="pad", r=0.16, above=False, size=0.44):
     bpy.ops.mesh.primitive_cylinder_add(radius=r, depth=0.22,
                                         location=(loc[0], loc[1], 0.24), vertices=16)
     bpy.context.object.data.materials.append(M[material])
     if label:
-        text(label, (loc[0], loc[1] + (0.78 if above else -0.72)), size=0.44, material="ink")
+        text(label, (loc[0], loc[1] + (0.78 if above else -0.72)), size=size, material="ink")
 
 def text(body, loc, size=0.4, material="ink", align="CENTER", z=0.02):
     bpy.ops.object.text_add(location=(loc[0], loc[1], z + size * 0.62))
@@ -119,14 +120,14 @@ esp = {
     "5V":   ( 5.0,  2.6),
 }
 for k, v in esp.items():
-    pad(v, {"GND1": "GND", "GND2": "GND", "34": "34",
-            "25": "25", "3V3": "3V3", "5V": "5V"}[k], above=True)
+    pad(v, {"GND1": "GND", "GND2": "GND", "34": "D34",
+            "25": "D25", "3V3": "3V3", "5V": "VIN"}[k], above=True)
 
 key_pins = {}
 for i, g in enumerate(["13", "14", "16", "17", "18", "19", "21", "22"]):
-    x = -3.85 + i * 1.1
+    x = -4.20 + i * 1.2
     key_pins[g] = (x, -2.6)
-    pad((x, -2.6), g, material="pad", r=0.14)
+    pad((x, -2.6), "D" + g, material="pad", r=0.14, size=0.34)
 
 # ---------------------------------------------------------------- microphone
 board("MIC", (-11.5, 4.6), (4.2, 3.4), "pcb_mic")
@@ -136,9 +137,18 @@ bpy.context.object.data.materials.append(M["spk"])
 text("MAX9814", (-11.5, 3.95), size=0.62, material="ink_hi", z=0.24)
 text("microphone  ·  INPUT", (-11.5, 1.6), size=0.46, material="dim")
 
-mic = {"VDD": (-13.0, 3.15), "GND": (-11.5, 3.15), "OUT": (-10.0, 3.15)}
+# Silkscreen order on a MAX9814 breakout, left to right with the capsule
+# facing you.  Two of the five are deliberately left unconnected.
+mic = {
+    "AR":   (-13.30, 3.15),
+    "OUT":  (-12.35, 3.15),
+    "GAIN": (-11.40, 3.15),
+    "VCC":  (-10.45, 3.15),
+    "GND":  ( -9.50, 3.15),
+}
 for k, v in mic.items():
-    pad(v, k, r=0.15)
+    unused = k in ("AR", "GAIN")
+    pad(v, k, material="pad_off" if unused else "pad", r=0.14, size=0.34)
 
 # ---------------------------------------------------------------- amplifier
 board("AMP", (11.0, 4.6), (5.0, 3.4), "pcb_amp")
@@ -171,9 +181,9 @@ text("4x4 KEYPAD", (0, -14.3), size=0.72, material="ink")
 
 # ---------------------------------------------------------------- wiring
 # microphone -> ESP32   (three wires, never touches the amplifier)
-wire(mic["VDD"], esp["3V3"], "w_pwr", arc=2.6)
-wire(mic["GND"], esp["GND1"], "w_gnd", arc=2.2)
-wire(mic["OUT"], esp["34"],  "w_mic", arc=1.8)
+wire(mic["OUT"], esp["34"],  "w_mic", arc=3.2)   # longest run, highest arc
+wire(mic["VCC"], esp["3V3"], "w_pwr", arc=2.3)
+wire(mic["GND"], esp["GND1"], "w_gnd", arc=1.7)
 
 # ESP32 -> amplifier
 wire(esp["25"],   amp["L"],   "w_aud", arc=2.4)
@@ -189,9 +199,9 @@ for i, g in enumerate(["13", "14", "16", "17", "18", "19", "21", "22"]):
     wire(key_pins[g], (-3.85 + i*1.1, -5.6), "w_key", arc=1.0, thick=0.055)
 
 # ---------------------------------------------------------------- legend
-text("RED = power      BLACK = ground      GREEN = mic signal      BLUE = audio out      AMBER = keypad",
+text("RED = power    BLACK = ground    GREEN = mic signal    BLUE = audio out    AMBER = keypad    GREY PAD = leave unconnected",
      (3.5, -16.8), size=0.62, material="ink")
-text("the microphone goes ONLY to the ESP32  —  it never touches the amplifier",
+text("pin names as printed on the devkit \u00b7 D25 IS GPIO 25\nthe microphone goes ONLY to the ESP32  —  it never touches the amplifier",
      (3.5, 11.6), size=0.78, material="ink")
 
 # ---------------------------------------------------------------- camera + light

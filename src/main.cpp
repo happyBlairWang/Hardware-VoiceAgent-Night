@@ -25,25 +25,124 @@
 #define SAMPLE_RATE   24000
 #define FRAME         320                 // 20 ms of audio
 #define LED           2
-#define SPK_CH        DAC_CHANNEL_1     // GPIO25 -> HW-104 L in
-#define SPK_BUF       16384             // power of two; ~2 s at 8 kHz
-#define SPK_RATE      8000              // telephone band; the relay downsamples
+// ---------------------------------------------------------------------------
+// Two ways to drive a speaker. Flip this when the NS4168 arrives.
+//
+//   0 = HW-104 / PAM8403 on the built-in 8-bit DAC (GPIO25)
+//   1 = NS4168 over real I2S, 16-bit
+//
+// The built-in DAC can only be driven from I2S0, and the microphone's built-in
+// ADC already owns I2S0 -- which is why the DAC path needs a hand-rolled timer
+// ISR. An EXTERNAL I2S amp has no such restriction: it runs on I2S1, with DMA
+// doing the timing. That is the whole reason the NS4168 is the better part.
+// ---------------------------------------------------------------------------
+#define USE_I2S_AMP   1
+
+#if USE_I2S_AMP
+  #define I2S_BCLK    26                // NS4168 BCLK
+  #define I2S_LRC     25                // NS4168 LRC  (a.k.a. LRCLK / WS)
+  #define I2S_DIN     27                // NS4168 DIN  (a.k.a. SDATA)
+  #define SPK_RATE    24000             // no resampling: the agent sends 24 kHz
+  #define SPK_BUF     16384             // samples, power of two (~680 ms)
+#else
+  #define SPK_CH      DAC_CHANNEL_1     // GPIO25 -> HW-104 L in
+  #define SPK_BUF     16384             // bytes, power of two; ~2 s at 8 kHz
+  #define SPK_RATE    8000              // telephone band; the relay downsamples
+#endif
 #define ECHO_TAIL_MS  300               // stay deaf this long after the last sample
-#define SPK_PRIME     1200              // 150 ms cushion before playback starts
-#define SPK_MAXLAG    4000              // 500 ms ceiling, so lag cannot pile up
-#define SPK_STALL     2000              // 250 ms: play a short tail rather than
+// Derived from the rate, so both amp paths get the same real-world timings
+// rather than numbers that only happened to suit 8 kHz.
+#define SPK_PRIME     (SPK_RATE / 7)    // ~150 ms cushion before playback starts
+#define SPK_MAXLAG    (SPK_RATE / 2)    // ~500 ms ceiling, so lag cannot pile up
+#define SPK_STALL     (SPK_RATE / 4)    // ~250 ms: play a short tail rather than
                                         // stranding it below the prime threshold
 
 static WebSocketsClient ws;
 static bool  linked = false;
 static float dcLevel = 2048.0f;           // tracks the mic's resting voltage
 
-// ---- speaker: 8-bit unsigned samples streamed from the relay ----
-static uint8_t           spkBuf[SPK_BUF];
+// ---- speaker: samples streamed from the relay ----
+#if USE_I2S_AMP
+static int16_t           spkBuf[SPK_BUF];      // signed 16-bit, 24 kHz
+#else
+static uint8_t           spkBuf[SPK_BUF];      // unsigned 8-bit, 8 kHz
+#endif
 static volatile uint32_t spkHead = 0, spkTail = 0;
+static volatile bool     echoGate = true;   // relay can switch this off
 
 static volatile bool     spkPlaying = false;
 static volatile uint32_t spkStall  = 0;
+
+#if USE_I2S_AMP
+// The relay sends raw little-endian int16 now, so the bytes land unchanged.
+static void spkPush(const uint8_t *d, size_t n) {
+  uint32_t q = (spkHead - spkTail) & (SPK_BUF - 1);
+  if (q > SPK_MAXLAG) spkTail = (spkTail + (q - SPK_MAXLAG)) & (SPK_BUF - 1);
+
+  const int16_t *src = (const int16_t *)d;
+  size_t count = n / 2;
+  for (size_t i = 0; i < count; i++) {
+    uint32_t nh = (spkHead + 1) & (SPK_BUF - 1);
+    if (nh == spkTail) break;
+    spkBuf[spkHead] = src[i];
+    spkHead = nh;
+  }
+}
+
+// i2s_write blocks until the DMA engine has room, so this task paces itself
+// against the hardware clock. No timer, no busy-wait, no drift.
+static void ampTask(void *) {
+  static int16_t chunk[128];
+  for (;;) {
+    uint32_t q = (spkHead - spkTail) & (SPK_BUF - 1);
+    if (!spkPlaying) {
+      if (q >= SPK_PRIME)            { spkPlaying = true; spkStall = 0; }
+      else if (q && ++spkStall > 45) { spkPlaying = true; spkStall = 0; }
+    } else if (q == 0) {
+      spkPlaying = false; spkStall = 0;
+    }
+
+    size_t n = 0;
+    if (spkPlaying) {
+      while (n < 128 && spkTail != spkHead) {
+        chunk[n++] = spkBuf[spkTail];
+        spkTail = (spkTail + 1) & (SPK_BUF - 1);
+      }
+    }
+    while (n < 128) chunk[n++] = 0;              // pad with silence
+
+    size_t wrote = 0;
+    i2s_write(I2S_NUM_1, chunk, sizeof(chunk), &wrote, portMAX_DELAY);
+  }
+}
+
+static void startAmp() {
+  i2s_config_t c = {};
+  c.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate          = SPK_RATE;
+  c.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  c.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+  c.dma_buf_count        = 8;
+  c.dma_buf_len          = 256;
+  c.use_apll             = false;
+  i2s_driver_install(I2S_NUM_1, &c, 0, NULL);
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num   = I2S_BCLK;
+  pins.ws_io_num    = I2S_LRC;
+  pins.data_out_num = I2S_DIN;
+  pins.data_in_num  = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM_1, &pins);
+  i2s_zero_dma_buffer(I2S_NUM_1);
+
+  xTaskCreatePinnedToCore(ampTask, "amp", 4096, NULL, 2, NULL, 1);
+  Serial.printf("[spk] NS4168 on I2S1  BCLK=%d LRC=%d DIN=%d @ %d Hz\n",
+                I2S_BCLK, I2S_LRC, I2S_DIN, SPK_RATE);
+}
+
+#else   // ---------------- built-in 8-bit DAC ----------------
 
 static void spkPush(const uint8_t *d, size_t n) {
   // Never let latency accumulate: if the network delivers a big burst, throw
@@ -93,19 +192,39 @@ static void IRAM_ATTR onSpkTick() {
   // Write the DAC register directly -- dac_output_voltage() is not ISR-safe.
   SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, v, RTC_IO_PDAC1_DAC_S);
 }
+#endif  // USE_I2S_AMP
 
 static void onWs(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      linked = true;  Serial.println("[ws] relay connected");  break;
+      linked = true;
+      Serial.println("[ws] relay connected");
+      // Announce the audio format we want, so the relay adapts instead of
+      // relying on a matching constant kept in two places.
+#if USE_I2S_AMP
+      ws.sendTXT("fmt:pcm16@24000");
+#else
+      ws.sendTXT("fmt:u8@8000");
+#endif
+      break;
     case WStype_DISCONNECTED:
       linked = false; Serial.println("[ws] relay lost");       break;
     case WStype_BIN:
       spkPush(payload, length);                        // operator's voice
       break;
-    case WStype_TEXT:
-      spkTail = spkHead;                               // barge-in: drop the tail
+    case WStype_TEXT: {
+      String cmd((char *)payload, length);
+      if (cmd == "gate:off") {
+        echoGate = false;
+        Serial.println("[gate] OFF - relying on server turn detection");
+      } else if (cmd == "gate:on") {
+        echoGate = true;
+        Serial.println("[gate] ON - mic muted while the speaker plays");
+      } else {
+        spkTail = spkHead;                             // barge-in: drop the tail
+      }
       break;
+    }
     default: break;
   }
 }
@@ -193,6 +312,9 @@ void setup() {
 
   startMic();
 
+#if USE_I2S_AMP
+  startAmp();
+#else
   dac_output_enable(SPK_CH);
   dac_output_voltage(SPK_CH, 128);
   spkTimer = timerBegin(0, 80, true);                 // 1 MHz tick
@@ -200,6 +322,7 @@ void setup() {
   timerAlarmWrite(spkTimer, 1000000 / SPK_RATE, true);
   timerAlarmEnable(spkTimer);
   Serial.printf("[spk] speaker live on GPIO25 @ %d Hz\n", SPK_RATE);
+#endif
 }
 
 void loop() {

@@ -66,6 +66,15 @@ button:focus-visible{outline:2px solid var(--brass);outline-offset:2px}
 /* volume */
 input[type=range]{width:100%;accent-color:var(--brass)}
 
+/* camera */
+.cam{position:relative;border:1px solid var(--line);border-radius:2px;background:var(--sunk);
+aspect-ratio:4/3;overflow:hidden;margin-bottom:6px}
+.cam img{width:100%;height:100%;object-fit:cover;display:none}
+.cam img.on{display:block}
+.cam-none{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.06em}
+.cam-none.gone{display:none}
+
 /* segmented source switch */
 .seg{display:flex;margin-bottom:14px;border:1px solid var(--line);border-radius:2px;overflow:hidden}
 .seg button{flex:1;border:0;border-radius:0;background:var(--sunk);padding:9px 6px;font-size:11.5px}
@@ -164,9 +173,17 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
 <div class="grid">
 <aside>
   <div class="blk">
+    <h2>Camera</h2>
+    <div class="cam" id="cam-wrap">
+      <img id="cam" alt="live view from the phone's camera">
+      <div class="cam-none" id="cam-none">no frames yet</div>
+    </div>
+  </div>
+
+  <div class="blk">
     <h2>Microphone</h2>
     <div class="seg" id="mic-seg">
-      <button class="on" data-mic="phone">Phone</button>
+      <button class="on" data-mic="phone">XIAO</button>
       <button data-mic="mac">Mac</button>
     </div>
     <div class="meter">
@@ -206,6 +223,11 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
   </div>
 
   <div class="blk">
+    <h2>Call</h2>
+    <div class="btns" style="margin-bottom:26px">
+      <button class="wide pri" data-cmd="call">Start a call (no phone)</button>
+    </div>
+
     <h2>Test the hardware</h2>
     <div class="btns">
       <button data-cmd="beep">Beep</button>
@@ -433,7 +455,13 @@ function connect() {
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
 
-    if (m.type === 'level') {
+    if (m.type === 'image') {
+      const img = document.getElementById('cam');
+      img.src = 'data:image/jpeg;base64,' + m.data;
+      img.classList.add('on');
+      document.getElementById('cam-none').classList.add('gone');
+
+    } else if (m.type === 'level') {
       level(m.rms);
 
     } else if (m.type === 'stats' || m.type === 'status') {
@@ -444,20 +472,42 @@ function connect() {
       $('p-gate').lastChild.textContent = deaf ? 'Deaf' : 'Listening';
       document.body.classList.toggle('deaf', deaf);
       $('f-gate').textContent = deaf ? 'mic held shut — operator speaking' : '';
-      document.querySelectorAll('button[data-cmd]').forEach(b =>
-        b.disabled = !m.esp && b.dataset.cmd !== 'clear');
-      document.querySelectorAll('#seg-gate button').forEach(b => b.disabled = !m.esp);
+      // What each button actually needs, rather than "is a phone attached".
+      const live = !!(m.esp || m.agent);          // a call is in progress
+      const canPlay = !!(m.esp || !m.to_phone);   // some speaker is reachable
+      document.querySelectorAll('button[data-cmd]').forEach(b => {
+        const c = b.dataset.cmd;
+        if (c === 'call')        b.disabled = live;        // only when idle
+        else if (c === 'clear')  b.disabled = false;
+        else                     b.disabled = !canPlay;
+      });
+      // The gate is enforced in the relay for BOTH audio sources, and the
+      // relay only forwards it to the phone when one is attached -- so this
+      // is meaningful with or without an ESP32.
+      document.querySelectorAll('#seg-gate button').forEach(b => b.disabled = false);
+      document.querySelectorAll('[data-out]').forEach(b => b.disabled = !m.esp
+          && b.dataset.out === 'phone');
 
       if (m.type === 'stats') {
         $('s-turns').textContent = m.turns ?? 0;
         $('s-sent').textContent = (m.sent_s ?? 0).toFixed(0) + 's';
         $('s-echo').textContent = (m.echo_s ?? 0).toFixed(0) + 's';
         $('s-voice').textContent = m.voice ?? '—';
+        if (typeof m.vol === 'number' && document.activeElement !== $('vol')) {
+          const pct = Math.round(m.vol * 100);
+          $('vol').value = pct;
+          $('vol-val').textContent = pct + '%';
+        }
+        if (typeof m.to_phone === 'boolean') {
+          document.querySelectorAll('[data-out]').forEach(b =>
+            b.classList.toggle('on',
+              (b.dataset.out === 'phone') === m.to_phone));
+        }
         if (m.mic) {
           document.querySelectorAll('#mic-seg button').forEach(b =>
             b.classList.toggle('on', b.dataset.mic === m.mic));
           $('mic-lab').textContent = m.mic === 'mac' ? 'Level · Mac mic'
-                                                     : 'Level · MAX9814';
+                                                     : 'Level · onboard PDM';
         }
         if (m.to_phone !== undefined)
           seg('#seg-out button', b => b.dataset.out === (m.to_phone ? 'phone' : 'mac'));

@@ -18,3 +18,7 @@ relay/tests.jsonl
 seeed/notes/*.wav
 seeed/notes/*.md
 *.blend1
+
+# Seeed's XVF3800 firmware images - 3.5 MB of vendor binaries that are
+# versioned upstream. firmware/xvf3800/README.md says how to fetch them.
+firmware/xvf3800/*.bin

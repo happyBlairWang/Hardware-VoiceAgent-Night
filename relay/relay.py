@@ -46,7 +46,7 @@ TAIL_S    = 0.20        # coarse backstop; the ESP32 now owns the real gate
 PROFILE   = "kids"      # "kids" or "operator" -- see PROFILES below
 TO_PHONE  = True        # route the reply to the ESP32 speaker, not the Mac
 PHONE_RATE = 8000       # what the ESP32 plays; 24k/8k = decimate by 3
-PHONE_VOL  = 0.5        # speaker level, 0.0-1.0 (change and restart the relay)
+PHONE_VOL  = 0.10        # speaker level, 0.0-1.0 (change and restart the relay)
 HERE      = Path(__file__).parent
 LOG       = HERE / "session.jsonl"
 TESTLOG   = HERE / "tests.jsonl"
@@ -217,11 +217,16 @@ def synth(freqs, ms, vol, glide=None):
 
 
 async def send_to_phone(data: bytes) -> bool:
-    """Push raw 8-bit samples at the speaker, paced so the device ring buffer
-    never overruns."""
-    if esp_ws is None:
-        await to_ui({"type": "note", "text": "no phone connected"})
-        return False
+    """Play generated audio out of whichever speaker is selected. The samples
+    arrive as unsigned 8-bit at PHONE_RATE; the Mac path needs signed 16-bit at
+    RATE, so convert rather than refusing when there is no phone attached."""
+    if esp_ws is None or not runtime["to_phone"]:
+        a = np.frombuffer(data, dtype=np.uint8).astype(np.float32)
+        pcm = (a - 128.0) * 256.0                       # u8 -> s16
+        reps = max(1, RATE // PHONE_RATE)               # 8 k -> 24 k
+        pcm = np.repeat(pcm, reps)
+        spk_q.put(pcm.clip(-32768, 32767).astype(np.int16).tobytes())
+        return True
     try:
         await esp_ws.send("flush")
         step = PHONE_RATE // 10                     # 100 ms per chunk
@@ -312,6 +317,21 @@ def record_test(test: str, ok: bool, detail: str = ""):
         f.write(json.dumps({"t": time.time(), "test": test,
                             "ok": ok, "detail": detail}) + "\n")
 
+def pick_device(want: str = "reSpeaker"):
+    """Prefer the reSpeaker if it is plugged in, else the system default.
+    Returns (input_index, output_index) or (None, None) for the default."""
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if want.lower() in d["name"].lower():
+                ins  = i if d["max_input_channels"]  > 0 else None
+                outs = i if d["max_output_channels"] > 0 else None
+                print(f"audio  using '{d['name']}' (device {i})", flush=True)
+                return ins, outs
+    except Exception:
+        pass
+    return None, None
+
+
 def load_key() -> str:
     env = HERE / ".env"
     if env.exists():
@@ -324,15 +344,22 @@ def load_key() -> str:
 
 # ------------------------------------------------------------------ one call
 async def handle_phone(esp):
+    """One call. `esp` is the phone's socket, or None for a Mac-only call --
+    which is how the reSpeaker works as a standalone USB mic and speaker with
+    no ESP32 in the picture at all."""
     global esp_ws
     esp_ws = esp
     # The device tells us what it wants; nothing to keep in sync by hand.
     #   "fmt:u8@8000"      HW-104 on the 8-bit DAC  -> decimate + convert
     #   "fmt:pcm16@24000"  NS4168 over I2S          -> pass 16-bit straight through
     fmt = {"bits": 8, "rate": 8000}
-    state["esp"] = True
+    state["esp"] = esp is not None
+    if esp is None:
+        runtime["mic"] = "mac"          # there is no phone mic to use
+        runtime["to_phone"] = False     # ...and nowhere to send audio but here
     await push_status()
-    print(f"\n=== phone connected from {esp.remote_address[0]} ===", flush=True)
+    who = esp.remote_address[0] if esp is not None else "the Mac (no phone)"
+    print(f"\n=== call started from {who} ===", flush=True)
     record("_call", "start")
 
     try:
@@ -347,12 +374,18 @@ async def handle_phone(esp):
             speak_until = 0.0        # monotonic time the speakers fall silent
 
             async def esp_to_agent():
+                if esp is None:
+                    await asyncio.Future()      # nothing to read; just park
                 nonlocal sent, dropped
                 await ready.wait()
                 n = 0
                 was_muted = None
                 async for frame in esp:
                     if isinstance(frame, str):
+                        if frame.startswith("img:"):
+                            stats["frames"] = stats.get("frames", 0) + 1
+                            await to_ui({"type": "image", "data": frame[4:]})
+                            continue
                         if frame.startswith("fmt:"):
                             spec = frame[4:]
                             enc, _, rate = spec.partition("@")
@@ -533,6 +566,13 @@ async def handle_ui(ws):
                 record_test("sweep", ok, f"200 Hz -> 3 kHz at {v:.0%}")
             elif c == "echo":
                 asyncio.create_task(echo_test())
+            elif c == "call":
+                if state["esp"] or state["agent"]:
+                    await to_ui({"type": "note", "text": "a call is already open"})
+                else:
+                    asyncio.create_task(handle_phone(None))
+            elif c == "hangup":
+                globals()["hangup_flag"] = True
             elif c == "mic":
                 v2 = m.get("value")
                 if v2 in ("phone", "mac"):
@@ -617,8 +657,10 @@ async def main():
     load_key()
     threading.Thread(target=serve_page, daemon=True).start()
     try:
+        dev_in, dev_out = pick_device()
         mac_in = sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                blocksize=1200, callback=on_mac_mic)
+                                blocksize=1200, callback=on_mac_mic,
+                                device=dev_in)
         mac_in.start()
         mac_ok = True
     except Exception as e:
@@ -626,7 +668,8 @@ async def main():
         print(f"mac mic unavailable ({e}) - phone mic only", flush=True)
 
     with sd.OutputStream(samplerate=RATE, channels=1, dtype="int16",
-                         blocksize=1200, callback=on_speaker):
+                         blocksize=1200, callback=on_speaker,
+                         device=dev_out):
         asyncio.create_task(telemetry())
         async with websockets.serve(router, "0.0.0.0", WS_PORT, max_size=None):
             print(f"relay  ws://0.0.0.0:{WS_PORT}", flush=True)

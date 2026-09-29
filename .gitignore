@@ -8,16 +8,11 @@ relay/.env
 __pycache__/
 *.pyc
 
-# a virtualenv was vendored into this tree by an earlier project
-seeed/relay/.venv/
-
 # runtime data: conversation transcripts and recordings.
 # These hold real speech, including a child's. Keep them local.
 relay/session.jsonl
 relay/tests.jsonl
 relay/notes.jsonl
-seeed/notes/*.wav
-seeed/notes/*.md
 *.blend1
 
 # Seeed's XVF3800 firmware images - 3.5 MB of vendor binaries that are

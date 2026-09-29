@@ -188,6 +188,43 @@ body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. S
 .ns.sA{color:var(--blu)} .ns.sB{color:var(--good)} .ns.sC{color:var(--warn)} .ns.sD{color:var(--bad)}
 .nrow.partial .nx{color:var(--faint);font-style:italic}
 .nempty{color:var(--faint);text-align:center;margin:40px auto;font-size:14px;line-height:1.8}
+/* ---- chat with your notes ---- */
+#pane-chat{display:flex;flex-direction:column;padding:0;gap:0}
+.cmsgs{flex:1;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:16px;min-height:0}
+.cmsg{max-width:min(680px,90%);display:flex;flex-direction:column;gap:5px}
+.cmsg.me{align-self:flex-end;align-items:flex-end}
+.cmsg .who{font-family:"IBM Plex Mono",monospace;font-size:9.5px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--faint)}
+.cbody{padding:11px 15px;border-radius:3px;line-height:1.55;border:1px solid var(--line);background:var(--panel)}
+.cmsg.me .cbody{border-left:3px solid var(--blu);white-space:pre-wrap}
+.cmsg.ai .cbody{border-left:3px solid var(--brass);background:var(--sunk)}
+.cmsg.err .cbody{border-left:3px solid var(--bad);color:var(--bad)}
+.cbody p{margin:0 0 8px}.cbody p:last-child{margin:0}
+.cbody ul{margin:4px 0 8px;padding-left:20px}.cbody li{margin:3px 0}
+.cbody strong{color:var(--ink);font-weight:600}
+.cite{font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--brass);
+  border:1px solid #3A3020;border-radius:2px;padding:0 4px;white-space:nowrap}
+.cmsg.ai.typing .cbody:empty::after{content:"thinking\2026";color:var(--faint);font-style:italic}
+.cempty{margin:auto;text-align:center;color:var(--faint);max-width:440px}
+.cempty h3{font-family:"Oswald",sans-serif;font-weight:500;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--dim);font-size:15px;margin:0 0 6px}
+.cempty p{font-size:13.5px;margin:0 0 16px;line-height:1.6}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.chips button{font-family:"Libre Franklin",sans-serif;text-transform:none;letter-spacing:0;
+  font-size:13px;padding:8px 12px}
+.composer{border-top:1px solid var(--line);padding:14px 22px 16px;display:flex;flex-direction:column;gap:10px}
+.crow{display:flex;gap:8px;align-items:flex-end}
+.crow textarea{flex:1;resize:none;min-height:42px;max-height:160px;padding:11px 13px;
+  background:var(--sunk);color:var(--ink);border:1px solid var(--line);border-radius:2px;
+  font:inherit;line-height:1.45}
+.crow textarea:focus{outline:none;border-color:var(--brass)}
+.crow button{padding:12px 18px}
+.cmeta{display:flex;align-items:center;gap:10px;font-family:"IBM Plex Mono",monospace;
+  font-size:11px;color:var(--faint)}
+.cmeta select{background:var(--sunk);color:var(--dim);border:1px solid var(--line);border-radius:2px;
+  font:inherit;padding:4px 6px;max-width:260px}
+.cmeta .grow{flex:1}
+.cmeta button{padding:4px 10px;font-size:10.5px}
 </style>
 
 <header>
@@ -294,6 +331,7 @@ body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. S
     <div class="tabs">
       <button class="tab on" data-tab="live">Live</button>
       <button class="tab" data-tab="notes">Notes<span class="badge" id="notes-badge"></span></button>
+      <button class="tab" data-tab="chat">Chat</button>
       <button class="tab" data-tab="calls">Past calls</button>
       <button class="tab" data-tab="tests">Test log</button>
     </div>
@@ -312,6 +350,34 @@ body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. S
     <div id="notes-list"></div>
     <div class="nrow partial" id="notes-partial" hidden>
       <span class="nt">now</span><span class="ns"></span><span class="nx"></span>
+    </div>
+  </div>
+  <div class="feed" id="pane-chat" hidden>
+    <div class="cmsgs" id="cmsgs">
+      <div class="cempty" id="cempty">
+        <h3>Ask your notes</h3>
+        <p>Questions are answered only from what the phone has written down, with the time
+           each thing was said. It will tell you when the notes don't cover something.</p>
+        <div class="chips">
+          <button data-ask="What did we talk about today?">What did we talk about today?</button>
+          <button data-ask="Are there any reminders or action items?">Any reminders or action items?</button>
+          <button data-ask="Summarise my most recent conversation.">Summarise my last conversation</button>
+          <button data-ask="What did each speaker say?">What did each speaker say?</button>
+        </div>
+      </div>
+    </div>
+    <div class="composer">
+      <div class="crow">
+        <textarea id="cin" rows="1" placeholder="Ask about your notes…"></textarea>
+        <button class="pri" id="csend">Send</button>
+      </div>
+      <div class="cmeta">
+        <span>model</span>
+        <select id="cmodel" aria-label="Model"><option>claude-haiku-4-5-20251001</option></select>
+        <span class="grow"></span>
+        <span>via AssemblyAI LLM Gateway</span>
+        <button id="cnew">New chat</button>
+      </div>
     </div>
   </div>
   <div class="feed" id="pane-calls" hidden></div>
@@ -531,6 +597,119 @@ function showMode(mode) {
 document.querySelectorAll('#mode-seg button').forEach(b =>
   b.addEventListener('click', () => send('mode', { value: b.dataset.mode })));
 
+// ---------------------------------------------------------------- chat with your notes
+let chatHistory = [], chatLive = null;       // chatLive: {id, el, text}
+const esc = s => s.replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Markdown-lite. Everything is escaped FIRST; the only tags that can appear are
+// the few added back below. Both the notes and the model's reply are text we
+// do not control, so neither may ever reach the page as raw HTML.
+function inline(s) {
+  return s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\[([A-Z][a-z]{2} \d{1,2} \d{2}:\d{2})\]/g, '<span class="cite">$1</span>');
+}
+function renderMd(text) {
+  let html = '', list = false;
+  for (const ln of esc(text).split('\n')) {
+    const li = ln.match(/^\s*(?:[-*\u2022]|\d+\.)\s+(.*)/);
+    if (li) { if (!list) { html += '<ul>'; list = true; } html += `<li>${inline(li[1])}</li>`; continue; }
+    if (list) { html += '</ul>'; list = false; }
+    if (ln.trim()) html += `<p>${inline(ln.replace(/^#+\s*/, ''))}</p>`;
+  }
+  return html + (list ? '</ul>' : '');
+}
+
+function chatBubble(kind, text) {
+  $('cempty')?.remove();
+  const d = document.createElement('div');
+  d.className = 'cmsg ' + kind;
+  d.innerHTML = `<div class="who">${kind === 'me' ? 'You' : kind === 'err' ? 'Error' : 'Notes'}</div>
+                 <div class="cbody"></div>`;
+  const body = d.querySelector('.cbody');
+  if (kind === 'me' || kind === 'err') body.textContent = text; else body.innerHTML = renderMd(text);
+  $('cmsgs').appendChild(d);
+  $('cmsgs').scrollTop = $('cmsgs').scrollHeight;
+  return d;
+}
+
+function setBusy(busy) {
+  $('csend').textContent = busy ? 'Stop' : 'Send';
+  $('cin').disabled = busy;
+}
+
+function ask(question) {
+  question = question.trim();
+  if (!question) return;
+  if (chatLive) return;                              // one at a time
+  if (!ws || ws.readyState !== 1) { chatBubble('err', 'Not connected to the relay.'); return; }
+  chatBubble('me', question);
+  const el = chatBubble('ai', '');
+  el.classList.add('typing');
+  const id = Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+  chatLive = { id, el, text: '', question };
+  setBusy(true);
+  send('chat', { id, question, model: $('cmodel').value, history: chatHistory });
+  $('cin').value = ''; $('cin').style.height = '';
+}
+
+function chatFinished(m) {
+  if (!chatLive || m.id !== chatLive.id) return;
+  chatLive.el.classList.remove('typing');
+  if (m.type === 'chat_error') {
+    chatLive.el.remove();
+    chatBubble('err', 'The model could not answer: ' + (m.error || 'unknown error'));
+  } else {
+    chatHistory.push({ role: 'user', content: chatLive.question },
+                     { role: 'assistant', content: chatLive.text });
+    chatHistory = chatHistory.slice(-12);
+  }
+  chatLive = null;
+  setBusy(false);
+  $('cin').focus();
+}
+
+$('csend').addEventListener('click', () => {
+  if (chatLive) { send('chat_stop', { id: chatLive.id }); return; }
+  ask($('cin').value);
+});
+$('cin').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask($('cin').value); }
+});
+$('cin').addEventListener('input', e => {        // grow with the text, up to a limit
+  e.target.style.height = ''; e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px';
+});
+document.querySelectorAll('[data-ask]').forEach(b =>
+  b.addEventListener('click', () => ask(b.dataset.ask)));
+$('cnew').addEventListener('click', () => {
+  if (chatLive) send('chat_stop', { id: chatLive.id });
+  chatHistory = []; chatLive = null; setBusy(false);
+  $('cmsgs').innerHTML = '';
+  $('cmsgs').appendChild(document.createRange().createContextualFragment(
+    '<div class="cempty"><h3>New chat</h3><p>Ask anything about your notes.</p></div>'));
+  $('cin').focus();
+});
+$('cmodel').addEventListener('change', e => {
+  try { localStorage.setItem('chatModel', e.target.value); } catch {}
+});
+
+function showModels(m) {
+  let saved = null;
+  try { saved = localStorage.getItem('chatModel'); } catch {}
+  const sel = $('cmodel');
+  sel.innerHTML = '';
+  const group = (label, list) => {
+    if (!list.length) return;
+    const g = document.createElement('optgroup'); g.label = label;
+    for (const id of list) { const o = document.createElement('option'); o.value = o.textContent = id; g.appendChild(o); }
+    sel.appendChild(g);
+  };
+  const n = m.preferred ?? 0;
+  group('Recommended', m.models.slice(0, n));
+  group(`More models (${m.models.length - n})`, m.models.slice(n));
+  sel.value = (saved && m.models.includes(saved)) ? saved : m.default;
+}
+
 async function loadCalls() {
   const rows = await lines('session.jsonl');
   const pane = $('pane-calls');
@@ -595,11 +774,12 @@ async function loadTests() {
   });
 }
 
-const panes = { live: 'feed', notes: 'pane-notes', calls: 'pane-calls', tests: 'pane-tests' };
+const panes = { live: 'feed', notes: 'pane-notes', chat: 'pane-chat', calls: 'pane-calls', tests: 'pane-tests' };
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === b));
   for (const [k, id] of Object.entries(panes)) $(id).hidden = (k !== b.dataset.tab);
   if (b.dataset.tab === 'notes') { loadNotes(); $('notes-badge').textContent = ''; }
+  if (b.dataset.tab === 'chat') setTimeout(() => $('cin').focus(), 0);
   if (b.dataset.tab === 'calls') loadCalls();
   if (b.dataset.tab === 'tests') loadTests();
 }));
@@ -610,9 +790,12 @@ function connect() {
   ws.onopen = () => {
     pill('p-relay', true);
     $('f-state').textContent = 'relay connected';
+    send('models');                      // fill the chat's model picker
   };
 
   ws.onclose = () => {
+    if (chatLive) chatFinished({ type: 'chat_error', id: chatLive.id,
+                                 error: 'lost the connection to the relay' });
     pill('p-relay', false); pill('p-esp', false); pill('p-agent', false);
     $('f-state').textContent = 'relay offline — retrying';
     document.querySelectorAll('button[data-cmd]').forEach(b => b.disabled = true);
@@ -695,6 +878,20 @@ function connect() {
         $('q-bar').style.width = Math.min(ms / 500 * 100, 100) + '%';
         if (deaf) level(0);
       }
+
+    } else if (m.type === 'models') {
+      showModels(m);
+
+    } else if (m.type === 'chat_delta') {
+      if (chatLive && m.id === chatLive.id) {
+        chatLive.text += m.text;
+        chatLive.el.classList.remove('typing');
+        chatLive.el.querySelector('.cbody').innerHTML = renderMd(chatLive.text);
+        $('cmsgs').scrollTop = $('cmsgs').scrollHeight;
+      }
+
+    } else if (m.type === 'chat_done' || m.type === 'chat_error') {
+      chatFinished(m);
 
     } else if (m.type === 'note_turn') {
       onNoteTurn(m);

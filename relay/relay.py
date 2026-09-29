@@ -32,6 +32,7 @@ device buffer depth plus the network hop, which is exactly how the operator
 used to end up transcribing itself.
 """
 import asyncio, base64, functools, http.server, json, queue, re, socketserver, sys, threading, time
+import urllib.error, urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -80,6 +81,37 @@ NOTES_CHUNK = 4800
 # and gets misheard ("Phil" came back once in testing), so treat it as a
 # convenience; the dashboard toggle is the reliable way back.
 WAKE = re.compile(r"\b(?:hey\s+)?(?:pip|pippa)\b", re.I)
+
+# ---------------------------------------------------------------- notes chat
+# Ask questions of your notes, Granola-style, through AssemblyAI's LLM Gateway:
+# one OpenAI-compatible endpoint in front of Claude, GPT, Gemini and others.
+# Verified live 2026-09-29:
+#   POST  /v1/chat/completions, OpenAI request shape
+#   auth  the raw key and "Bearer <key>" BOTH work -- unlike the two audio APIs,
+#         which each insist on exactly one of those
+#   GET   /v1/models lists what is really available. The quickstart's example
+#         model, qwen3.5-4b-fast, is not in it: 400 "model ... is not supported".
+#   "stream": true gives OpenAI-style SSE: "data: {...}" lines, then "data: [DONE]"
+LLM_BASE = "https://llm-gateway.assemblyai.com/v1"
+LLM_DEFAULT = "claude-haiku-4-5-20251001"      # quick enough to feel like chat
+LLM_PREFERRED = [                               # shown first, if still offered
+    "claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5-5",
+    "gpt-5-mini", "gpt-5.5", "gemini-3.5-flash", "qwen3.5-4b-32k-fast",
+]
+NOTES_CONTEXT_CHARS = 80_000     # most recent notes that fit; plenty for a home phone
+
+CHAT_SYSTEM = """You are the chat for a notetaker, like Granola's. You answer questions \
+about the user's notes: transcripts captured by a talking telephone.
+
+People are labelled "Speaker A", "Speaker B" and so on. "{agent}" is the phone's own \
+voice assistant. Today is {today}.
+
+Rules:
+- Answer ONLY from the notes below. If they do not contain the answer, say so plainly. \
+Never guess or invent.
+- When you state something from the notes, cite when it was said, like [Sep 29 14:47].
+- Be concise. Use a short bulleted list when there are several items.
+{truncated}"""
 TESTLOG   = HERE / "tests.jsonl"
 
 # Two personalities. Switch with PROFILE above; the voice is fixed for the
@@ -746,6 +778,137 @@ async def handle_phone(esp):
         state["esp"] = state["agent"] = state["muted"] = False
         await push_status()
 
+def notes_context(limit: int = NOTES_CONTEXT_CHARS) -> tuple[str, int, bool]:
+    """Notes as dated lines for the model: the most recent that fit in `limit`.
+    Returns (text, total turns on file, whether older turns were left out)."""
+    lines = []
+    if NOTES_LOG.exists():
+        for raw in NOTES_LOG.read_text().splitlines():
+            try:
+                r = json.loads(raw)
+            except Exception:
+                continue
+            who = (r.get("speaker") if r.get("src") == "agent"
+                   else f"Speaker {r.get('speaker', '?')}")
+            when = time.strftime("%b %d %H:%M", time.localtime(r.get("t", 0)))
+            lines.append(f"[{when}] {who}: {r.get('text', '')}")
+    kept, size = [], 0
+    for ln in reversed(lines):                      # newest first, until full
+        if size + len(ln) + 1 > limit:
+            break
+        kept.append(ln)
+        size += len(ln) + 1
+    return "\n".join(reversed(kept)), len(lines), len(kept) < len(lines)
+
+
+_models: list[str] | None = None
+
+def list_models(key: str) -> list[str]:
+    """What the gateway offers right now, preferred ones first. Asked live, so
+    the picker never offers a model that would fail."""
+    global _models
+    if _models is None:
+        try:
+            req = urllib.request.Request(f"{LLM_BASE}/models",
+                                         headers={"authorization": key})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.load(r)
+            live = [m.get("id") for m in d.get("data", []) if m.get("id")]
+            _models = ([m for m in LLM_PREFERRED if m in live]
+                       + sorted(m for m in live if m not in LLM_PREFERRED))
+        except Exception as e:
+            print(f"  [chat] could not list models ({e}); using defaults", flush=True)
+            return list(LLM_PREFERRED)              # try again next time
+    return _models
+
+
+def _stream_chat(key: str, body: dict, stop: threading.Event, on_delta) -> str | None:
+    """Worker thread: stream one completion, handing each text chunk to
+    `on_delta`. Returns an error message, or None if it finished."""
+    req = urllib.request.Request(
+        f"{LLM_BASE}/chat/completions", data=json.dumps(body).encode(), method="POST",
+        headers={"authorization": key, "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            for raw in r:
+                if stop.is_set():
+                    return None
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return None
+                try:
+                    d = json.loads(data)
+                except ValueError:
+                    continue
+                piece = ((d.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                if piece:
+                    on_delta(piece)
+        return None
+    except urllib.error.HTTPError as e:
+        try:
+            j = json.loads(e.read())
+            why = "; ".join((j.get("metadata") or {}).get("errors") or []) \
+                  or j.get("message") or j.get("error")
+        except Exception:
+            why = e.reason
+        return f"{e.code}: {why}"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+_chat_stops: dict[str, threading.Event] = {}
+
+async def _reply(ws, msg: dict):
+    try:
+        await ws.send(json.dumps(msg))
+    except Exception:
+        pass                                        # that tab has gone
+
+
+async def answer_chat(ws, cid: str, question: str, model: str, history: list):
+    """Answer one question about the notes, streaming the reply to the tab
+    that asked -- not to every open dashboard."""
+    loop = asyncio.get_running_loop()
+    ctx, total, truncated = notes_context()
+    if not total:
+        await _reply(ws, {"type": "chat_delta", "id": cid,
+                          "text": "There are no notes yet. Talk near the phone "
+                                  "and they'll appear here to ask about."})
+        await _reply(ws, {"type": "chat_done", "id": cid, "model": model})
+        return
+
+    system = CHAT_SYSTEM.format(
+        agent=NAME, today=time.strftime("%A %b %d %Y, %H:%M"),
+        truncated=("- Only the most recent notes are included below; older ones were "
+                   "left out. Say so if the question may be about earlier.")
+                  if truncated else "")
+    body = {"model": model, "stream": True, "max_tokens": 1200,
+            "messages": [{"role": "system", "content": f"{system}\n\nNOTES:\n{ctx}"},
+                         *history[-12:], {"role": "user", "content": question}]}
+
+    # The HTTP stream runs on a worker thread. Its chunks come back through one
+    # queue, in order -- scheduling a separate send per chunk from the thread
+    # could let them interleave and scramble the text.
+    q: asyncio.Queue = asyncio.Queue()
+    stop = _chat_stops[cid] = threading.Event()
+    work = loop.run_in_executor(None, _stream_chat, load_key(), body, stop,
+                                lambda t: loop.call_soon_threadsafe(q.put_nowait, t))
+    work.add_done_callback(lambda _: q.put_nowait(None))
+    try:
+        while (piece := await q.get()) is not None:
+            await _reply(ws, {"type": "chat_delta", "id": cid, "text": piece})
+        err = work.result()
+    finally:
+        _chat_stops.pop(cid, None)
+    print(f"  [chat] {model}: {question[:60]!r}"
+          f"{f'  ERROR {err}' if err else ''}", flush=True)
+    await _reply(ws, {"type": "chat_error" if err else "chat_done",
+                      "id": cid, "model": model, "error": err})
+
+
 async def handle_ui(ws):
     ui_clients.add(ws)
     await push_status()
@@ -756,6 +919,26 @@ async def handle_ui(ws):
             except Exception:
                 continue
             c, v = m.get("cmd"), runtime["vol"]
+            if c == "chat":
+                question = str(m.get("question") or "").strip()[:4000]
+                if question:
+                    history = [{"role": h["role"], "content": str(h.get("content", ""))[:8000]}
+                               for h in (m.get("history") or [])
+                               if isinstance(h, dict) and h.get("role") in ("user", "assistant")]
+                    asyncio.create_task(answer_chat(
+                        ws, str(m.get("id") or time.time()), question,
+                        str(m.get("model") or LLM_DEFAULT), history))
+                continue
+            if c == "chat_stop":
+                if (ev := _chat_stops.get(str(m.get("id")))):
+                    ev.set()
+                continue
+            if c == "models":
+                models = await asyncio.get_running_loop().run_in_executor(
+                    None, list_models, load_key())
+                await _reply(ws, {"type": "models", "models": models, "default": LLM_DEFAULT,
+                                  "preferred": sum(m in LLM_PREFERRED for m in models)})
+                continue
             if c == "beep":
                 ok = await send_to_phone(synth([1000], 700, v))
                 record_test("beep", ok, f"1 kHz 0.7s at {v:.0%}")
@@ -894,6 +1077,7 @@ async def main():
                   f"{'ESP32 speaker' if TO_PHONE else 'Mac speakers'}", flush=True)
             print("turn   detection on (vad 0.5, silence 900-3000 ms), "
                   "voice focus near-field", flush=True)
+            print(f"chat   ask your notes via LLM Gateway (default {LLM_DEFAULT})", flush=True)
             print("notes  streaming notetaker in parallel "
                   "(universal-3-5-pro, speaker labels, max accuracy)", flush=True)
             print(f"mic    source '{runtime['mic']}'"

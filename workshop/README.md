@@ -1,10 +1,10 @@
-# Workshop: a voice you can talk to, that also takes notes
+# Workshop: a voice you can talk to, that also takes notes you can ask about
 
 Three phases. Each one works on its own, and each builds on the last.
 
 | Phase | You build | AssemblyAI API | Time |
 |---|---|---|---|
-| [1 · Notetaker](phase-1-notetaker.md) | Live, speaker-labelled notes | Streaming STT | ~30 min |
+| [1 · Notetaker](phase-1-notetaker.md) | Live, speaker-labelled notes you can ask questions of | Streaming STT + LLM Gateway | ~40 min |
 | [2 · Voice agent](phase-2-voice-agent.md) | A character you can talk to | Voice Agent | ~30 min |
 | [3 · Both at once](phase-3-agent-and-notes.md) | Talk to it *and* keep accurate notes | Both, in parallel | ~45 min |
 
@@ -19,6 +19,7 @@ flowchart LR
     A -- reply audio --> spk([Speaker])
     S --> notes[(Notes)]
     A --> notes
+    notes -- ask --> G[LLM Gateway<br/>Claude · GPT · Gemini]
     relay --> web[Web app<br/>localhost:8081]
 ```
 
@@ -35,8 +36,8 @@ deals with it when you can't.
 ## Setup (once)
 
 ```bash
-git clone https://github.com/hsingh-aai/esp32-vintage-phone
-cd esp32-vintage-phone
+git clone https://github.com/hsingh-aai/Hardware-VoiceAgent-Night
+cd Hardware-VoiceAgent-Night
 
 python3 -m venv ~/esp-tools
 ~/esp-tools/bin/pip install websockets sounddevice numpy

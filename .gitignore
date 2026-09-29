@@ -15,6 +15,7 @@ seeed/relay/.venv/
 # These hold real speech, including a child's. Keep them local.
 relay/session.jsonl
 relay/tests.jsonl
+relay/notes.jsonl
 seeed/notes/*.wav
 seeed/notes/*.md
 *.blend1

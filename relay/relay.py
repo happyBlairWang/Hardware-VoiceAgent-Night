@@ -31,8 +31,9 @@ kept here is only a coarse backstop -- relay-side timing runs early by the
 device buffer depth plus the network hop, which is exactly how the operator
 used to end up transcribing itself.
 """
-import asyncio, base64, functools, http.server, json, queue, socketserver, sys, threading, time
+import asyncio, base64, functools, http.server, json, queue, re, socketserver, sys, threading, time
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy as np
 import sounddevice as sd
@@ -49,6 +50,36 @@ PHONE_RATE = 8000       # what the ESP32 plays; 24k/8k = decimate by 3
 PHONE_VOL  = 0.10        # speaker level, 0.0-1.0 (change and restart the relay)
 HERE      = Path(__file__).parent
 LOG       = HERE / "session.jsonl"
+NOTES_LOG = HERE / "notes.jsonl"      # the notetaker's record, one turn per line
+
+# Notes run on AssemblyAI's Streaming API, in parallel with the Voice Agent.
+# The agent is tuned to reply fast; this one is tuned to be RIGHT, and it
+# labels speakers, which the agent's own transcript does not.
+# Verified live 2026-09-29, at this mic's native 24 kHz (no resampling):
+#   header  Authorization: <key>          -- no "Bearer", unlike the agent
+#   send    raw binary PCM frames, then {"type":"Terminate"}
+#   recv    Begin / SpeechStarted / Turn / Termination
+#   speaker arrives as "speaker_label" ("A", "B", ...) -- NOT "speaker"
+NOTES_URL = "wss://streaming.assemblyai.com/v3/ws"
+NOTES_PARAMS = {
+    "sample_rate": 24000, "encoding": "pcm_s16le",
+    "speech_model": "universal-3-5-pro",
+    "format_turns": "true",            # punctuation and casing -- this is for reading
+    "speaker_labels": "true",
+    "mode": "max_accuracy",            # the agent wants speed; notes want accuracy
+    "min_turn_silence": 560, "max_turn_silence": 2000,
+}
+# Every audio message must be 50-1000 ms long, or the server closes the socket
+# with 3007 "Input Duration Violation". The phone sends 320-sample frames --
+# 13 ms -- which the Voice Agent accepts and this API does not. So the
+# notetaker batches them into 100 ms (2400 samples x 2 bytes) before sending.
+NOTES_CHUNK = 4800
+
+# In notes mode Pip is not listening, so it cannot be asked to come back.
+# The notetaker still is -- so it watches for the name instead. "Pip" is short
+# and gets misheard ("Phil" came back once in testing), so treat it as a
+# convenience; the dashboard toggle is the reliable way back.
+WAKE = re.compile(r"\b(?:hey\s+)?(?:pip|pippa)\b", re.I)
 TESTLOG   = HERE / "tests.jsonl"
 
 # Two personalities. Switch with PROFILE above; the voice is fixed for the
@@ -104,6 +135,16 @@ NAME  = _p.get("name", "Operator")
 # "tool.call" carrying call_id/name/arguments, and the reply is "tool.result"
 # whose "result" must be a JSON-ENCODED STRING, not a nested object.
 TOOLS = [
+    {
+        "type": "function",
+        "name": "start_listening",
+        "description": ("Stop talking and quietly take notes instead. Use when "
+                        "someone says 'just listen', 'take notes', 'be quiet for "
+                        "a bit' or 'I want to think out loud'. Say a short goodbye "
+                        "first. You will not hear anything until someone says your "
+                        "name again."),
+        "parameters": {"type": "object", "properties": {}},
+    },
     {
         "type": "function",
         "name": "set_volume",
@@ -180,7 +221,9 @@ state = {"esp": False, "agent": False, "muted": False}
 esp_ws  = None                      # the phone's socket, when it is connected
 capture = None                      # collects mic audio during an echo test
 runtime = {"vol": PHONE_VOL, "to_phone": TO_PHONE, "gate": True,
-           "mic": "phone"}          # "phone" = MAX9814, "mac" = built-in
+           "mic": "phone",          # "phone" = MAX9814, "mac" = built-in
+           "mode": "talk",          # "talk" = Pip answers + notes; "notes" = listen only
+           "pending_mode": None}    # a switch waiting for Pip to finish speaking
 
 # The Mac's microphone, as a fallback source. The stream always runs; the
 # callback only queues audio while that source is selected, so switching is
@@ -264,6 +307,20 @@ async def echo_test(seconds: float = 3.0):
 
 async def run_tool(name: str, args: dict) -> dict:
     """Apply a tool the agent invoked. Returns whatever it should hear back."""
+    if name == "start_listening":
+        # Defer the switch until Pip finishes its goodbye: switching now would
+        # discard the very reply that says it. Applied on the next reply.done,
+        # with a fallback in case no reply comes.
+        runtime["pending_mode"] = "notes"
+
+        async def fallback():
+            await asyncio.sleep(8)
+            if runtime.get("pending_mode") == "notes":
+                await set_mode("notes", why=f"{NAME} was asked to listen")
+        asyncio.create_task(fallback())
+        return {"mode": "listening",
+                "note": "notes are being taken; you are muted until your name is said"}
+
     before = runtime["vol"]
     if name == "set_volume":
         runtime["vol"] = max(0.0, min(1.0, float(args.get("percent", 50)) / 100))
@@ -283,6 +340,40 @@ async def run_tool(name: str, args: dict) -> dict:
     return {"volume_percent": pct}
 
 
+def record_note(src: str, speaker: str, text: str, conf: float | None = None):
+    """One finished turn of notes. `src` is "mic" (the notetaker heard it) or
+    "agent" (Pip said it -- taken from the agent's own clean transcript rather
+    than re-transcribed off the speaker)."""
+    row = {"t": time.time(), "src": src, "speaker": speaker, "text": text}
+    if conf is not None:
+        row["conf"] = round(conf, 2)
+    with NOTES_LOG.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    return row
+
+
+async def set_mode(mode: str, why: str = ""):
+    runtime["pending_mode"] = None
+    if mode not in ("talk", "notes") or runtime["mode"] == mode:
+        return
+    runtime["mode"] = mode
+    if mode == "notes":
+        # Stop anything Pip was mid-way through saying. A reply already being
+        # generated would otherwise finish playing after the switch.
+        while not spk_q.empty():
+            spk_q.get_nowait()
+        _tail.clear()
+        if esp_ws is not None and runtime["to_phone"]:
+            try:
+                await esp_ws.send("flush")
+            except Exception:
+                pass
+    label = "talking - Pip answers" if mode == "talk" else "listening - notes only"
+    print(f"  [mode] {label}{f'  ({why})' if why else ''}", flush=True)
+    await to_ui({"type": "note", "text": f"now {label}"})
+    await to_ui({"type": "mode", "mode": mode})
+
+
 async def telemetry():
     while True:
         await asyncio.sleep(0.3)
@@ -290,7 +381,8 @@ async def telemetry():
             await to_ui({"type": "stats", **stats, **state,
                          "vol": runtime["vol"], "profile": PROFILE, "voice": VOICE,
                          "to_phone": runtime["to_phone"], "gate": runtime["gate"],
-                         "mic": runtime["mic"]})
+                         "mic": runtime["mic"], "mode": runtime["mode"],
+                         "notes_live": state.get("notes", False)})
 
 async def to_ui(msg: dict):
     if not ui_clients:
@@ -373,6 +465,16 @@ async def handle_phone(esp):
             sent = dropped = 0
             speak_until = 0.0        # monotonic time the speakers fall silent
 
+            # Audio for the notetaker. Bounded so a stalled notes connection
+            # drops frames instead of growing without limit or blocking Pip.
+            notes_q: asyncio.Queue = asyncio.Queue(maxsize=400)
+
+            def to_notes(frame: bytes):
+                try:
+                    notes_q.put_nowait(frame)
+                except asyncio.QueueFull:
+                    pass
+
             async def esp_to_agent():
                 if esp is None:
                     await asyncio.Future()      # nothing to read; just park
@@ -419,15 +521,21 @@ async def handle_phone(esp):
                         stats["echo_s"] = dropped / 2 / RATE
                         continue
 
+                    n += 1
+                    if n % 5 == 0:
+                        await to_ui({"type": "level", "rms": stats["rms"]})
+
+                    # Fan out. Echo-gated frames never reach here, so neither
+                    # stream transcribes Pip's own voice off the speaker.
+                    to_notes(frame)                   # the notetaker always hears
+                    if runtime["mode"] != "talk":
+                        continue                      # Pip only hears in talk mode
                     sent += len(frame)
                     stats["sent_s"] = sent / 2 / RATE
                     await agent.send(json.dumps({
                         "type": "input.audio",
                         "audio": base64.b64encode(frame).decode(),
                     }))
-                    n += 1
-                    if n % 5 == 0:
-                        await to_ui({"type": "level", "rms": stats["rms"]})
 
             async def mac_to_agent():
                 """Same job as esp_to_agent, but sourced from the laptop. Uses
@@ -448,6 +556,9 @@ async def handle_phone(esp):
                     state["muted"] = False
                     a = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
                     stats["rms"] = min(float(np.sqrt((a * a).mean())) / 6000.0, 1.0)
+                    to_notes(frame)
+                    if runtime["mode"] != "talk":
+                        continue
                     sent += len(frame)
                     stats["sent_s"] = sent / 2 / RATE
                     await agent.send(json.dumps({
@@ -462,6 +573,8 @@ async def handle_phone(esp):
                     t = m.get("type", "")
 
                     if t == "reply.audio":
+                        if runtime["mode"] == "notes":
+                            continue        # listening only: Pip stays silent
                         pcm = base64.b64decode(m["data"])
                         if runtime["to_phone"]:
                             a = np.frombuffer(pcm, dtype=np.int16)
@@ -487,12 +600,20 @@ async def handle_phone(esp):
                     elif t == "transcript.agent.delta":
                         line.append(m.get("delta", ""))
                     elif t in ("transcript.agent", "reply.done"):
+                        if t == "reply.done" and runtime.get("pending_mode"):
+                            await set_mode(runtime["pending_mode"],
+                                           why=f"{NAME} was asked to listen")
                         if line:
-                            said = " ".join(line); line.clear()
+                            # deltas carry their own spacing; collapse the doubles
+                            said = " ".join(" ".join(line).split()); line.clear()
                             print(f"  operator: {said}", flush=True)
                             record("operator", said)
                             stats["turns"] += 1
                             await to_ui({"type": "agent", "text": said})
+                            # Pip's side of the notes comes from its own clean
+                            # transcript, not re-transcribed off the speaker.
+                            row = record_note("agent", NAME, said)
+                            await to_ui({"type": "note_turn", **row})
                     elif t.startswith("transcript.user"):
                         txt = (m.get("text") or m.get("transcript")
                                or m.get("delta") or "").strip()
@@ -526,11 +647,97 @@ async def handle_phone(esp):
                         await to_ui({"type": "note",
                                      "text": f"agent error: {m.get('code')}"})
 
+            async def notes_stream():
+                """The notetaker: a second, independent connection to the
+                Streaming API. A failure here must never end the call, so it
+                contains its own errors and reconnects."""
+                url = f"{NOTES_URL}?{urlencode(NOTES_PARAMS)}"
+                key = load_key()
+                while True:
+                    try:
+                        async with websockets.connect(
+                            url, additional_headers={"Authorization": key},
+                            max_size=None, open_timeout=15,
+                        ) as ns:
+                            while not notes_q.empty():      # stale while we were away
+                                notes_q.get_nowait()
+
+                            async def pump():
+                                buf = bytearray()
+                                while True:
+                                    buf += await notes_q.get()
+                                    while len(buf) >= NOTES_CHUNK:
+                                        await ns.send(bytes(buf[:NOTES_CHUNK]))
+                                        del buf[:NOTES_CHUNK]
+
+                            async def read():
+                                async for raw in ns:
+                                    m = json.loads(raw)
+                                    t = m.get("type")
+                                    if t == "Begin":
+                                        state["notes"] = True
+                                        await push_status()
+                                        print("  [notes] notetaker listening", flush=True)
+                                    elif t == "Turn":
+                                        text = (m.get("transcript") or "").strip()
+                                        if not text:
+                                            continue
+                                        spk = m.get("speaker_label") or "?"
+                                        if m.get("end_of_turn") and m.get("turn_is_formatted"):
+                                            row = record_note("mic", spk, text,
+                                                              m.get("speaker_confidence"))
+                                            print(f"  [notes] {spk}: {text}", flush=True)
+                                            await to_ui({"type": "note_turn", **row})
+                                            if runtime["mode"] == "notes" and WAKE.search(text):
+                                                await set_mode("talk", why=f'heard "{text[:40]}"')
+                                        else:
+                                            await to_ui({"type": "note_partial",
+                                                         "speaker": spk, "text": text})
+                                    elif t == "Error":
+                                        print(f"  [notes] server error "
+                                              f"{m.get('error_code')}: {m.get('error')}",
+                                              flush=True)
+                                    elif t == "Termination":
+                                        return
+
+                            jobs = [asyncio.create_task(pump()),
+                                    asyncio.create_task(read())]
+                            try:
+                                done, _ = await asyncio.wait(
+                                    jobs, return_when=asyncio.FIRST_COMPLETED)
+                                for j in done:
+                                    j.result()              # surface the error, if any
+                            except asyncio.CancelledError:
+                                # hanging up: ask the server to finalise the
+                                # last turn rather than just dropping the line
+                                try:
+                                    await asyncio.wait_for(
+                                        ns.send(json.dumps({"type": "Terminate"})), 1)
+                                except Exception:
+                                    pass
+                                raise
+                            finally:
+                                for j in jobs:
+                                    j.cancel()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"  [notes] dropped ({type(e).__name__}: {e}); "
+                              f"retrying in 2s", flush=True)
+                    finally:
+                        state["notes"] = False
+                    await asyncio.sleep(2)
+
+            # A task of its own, cancelled on hang-up. Inside the gather below it
+            # would outlive the call: gather does not cancel siblings when one
+            # fails, so a dead call would leave a billed stream reconnecting.
+            notes_task = asyncio.create_task(notes_stream())
             try:
                 await asyncio.gather(esp_to_agent(), mac_to_agent(), agent_to_out())
             except websockets.ConnectionClosed:
                 pass
             finally:
+                notes_task.cancel()
                 record("_call", "end")
                 print(f"=== hung up ({sent/2/RATE:.1f}s sent, "
                       f"{dropped/2/RATE:.1f}s muted as echo) ===", flush=True)
@@ -573,6 +780,8 @@ async def handle_ui(ws):
                     asyncio.create_task(handle_phone(None))
             elif c == "hangup":
                 globals()["hangup_flag"] = True
+            elif c == "mode":
+                await set_mode(m.get("value", ""), why="dashboard")
             elif c == "mic":
                 v2 = m.get("value")
                 if v2 in ("phone", "mac"):
@@ -609,6 +818,8 @@ async def handle_ui(ws):
                 record_test("echo mode", True, mode)
             elif c == "clear":
                 await to_ui({"type": "clear"})
+    except websockets.ConnectionClosed:
+        pass                    # a closed browser tab is not an error
     finally:
         ui_clients.discard(ws)
 
@@ -620,7 +831,8 @@ async def router(ws):
         await handle_phone(ws)
 
 ALLOWED = {"/": "ui.html", "/ui.html": "ui.html",
-           "/session.jsonl": "session.jsonl", "/tests.jsonl": "tests.jsonl"}
+           "/session.jsonl": "session.jsonl", "/tests.jsonl": "tests.jsonl",
+           "/notes.jsonl": "notes.jsonl"}
 
 
 class Guarded(http.server.SimpleHTTPRequestHandler):
@@ -682,6 +894,8 @@ async def main():
                   f"{'ESP32 speaker' if TO_PHONE else 'Mac speakers'}", flush=True)
             print("turn   detection on (vad 0.5, silence 900-3000 ms), "
                   "voice focus near-field", flush=True)
+            print("notes  streaming notetaker in parallel "
+                  "(universal-3-5-pro, speaker labels, max accuracy)", flush=True)
             print(f"mic    source '{runtime['mic']}'"
                   f"{'' if mac_ok else '  (mac mic unavailable)'}", flush=True)
             await asyncio.Future()

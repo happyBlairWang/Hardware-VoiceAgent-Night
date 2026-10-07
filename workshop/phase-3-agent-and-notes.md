@@ -112,7 +112,7 @@ from phase 2, now costing you notes. Hardware echo cancellation fixes both.
 **The wake word has to be an address, not a mention.** The first name, "Pip", came
 back as "Phil". "Furby" survives transcription better, but it also turns up in
 conversation — at a Furby workshop, constantly — and a passing *"a Furby that
-Devin bought"* woke it. So `WAKE` only fires on **"Hey / OK / Hi Furby"**, or on
+someone bought"* woke it. So `WAKE` only fires on **"Hey / OK / Hi Furby"**, or on
 **"Furby,"** opening a turn. The notetaker's formatter adds that comma for a
 direct address (*"Furby, wake up"*) but not for a mention (*"Furby workshop starts
 at six"*). The Mode switch is still the sure way back.

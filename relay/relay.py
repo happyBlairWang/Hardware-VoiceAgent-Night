@@ -87,7 +87,7 @@ NOTES_CHUNK = 4800
 # survive transcription far better than one did ("Pip" came back as "Phil"),
 # and near-misses are matched too; the dashboard toggle stays the sure way back.
 # Must be an ADDRESS, not a mention. With the "hey" optional, a passing
-# "...a Furby that Devin bought" in the room woke it -- and at a Furby workshop
+# "...a Furby that someone bought" in the room woke it -- and at a Furby workshop
 # the name comes up constantly. Two forms count:
 #   "hey / ok / hi Furby" anywhere in the turn, or
 #   "Furby," opening the turn. The notetaker's formatter punctuates a direct

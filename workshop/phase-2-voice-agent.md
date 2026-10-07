@@ -36,7 +36,7 @@ top of [`relay/voice_agent.py`](../relay/voice_agent.py) — `system_prompt`,
 
 Open http://localhost:8081, leave **Mode → Talk + notes**, press **Start a call
 (no phone)**. The **Live** tab shows the conversation as it happens. Try
-*"Pip, turn it up"* — the agent changes its own volume (see Tools below).
+*"Furby, turn it up"* — the agent changes its own volume (see Tools below).
 
 ## The contract (verified against the live API)
 
@@ -96,7 +96,7 @@ cancellation removes that trade-off.
 ## Tools: letting it act
 
 The agent can call functions you define. This one turns its own volume up
-(verified by voice: *"Pip, turn it up"* → `adjust_volume(direction="up")`):
+(verified by voice: *"Furby, turn it up"* → `adjust_volume(direction="up")`):
 
 ```python
 {"type": "function", "name": "adjust_volume",

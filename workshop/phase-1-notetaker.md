@@ -204,7 +204,7 @@ whichever provider serves the model you picked.
 
 ## Try this
 
-1. Add `"keyterms_prompt": json.dumps(["Pip", "Grandma"])` and see names recognised.
+1. Add `"keyterms_prompt": json.dumps(["Furby", "Grandma"])` and see names recognised.
 2. Swap `max_accuracy` for `balanced` and compare the notes side by side.
 3. Ask the same question with `gpt-5-mini` and `gemini-3.5-flash` — does the answer change?
 4. Make `ask_notes.py` a loop, sending the previous turns along so follow-ups work.

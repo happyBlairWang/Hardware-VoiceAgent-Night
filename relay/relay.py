@@ -766,6 +766,10 @@ async def handle_phone(esp):
                     if gated:
                         dropped += len(frame)     # the operator is talking; ignore the room
                         stats["echo_s"] = dropped / 2 / RATE
+                        # Silence, not nothing. The notetaker ends a turn when it
+                        # HEARS silence; starving it while Furby replies left the
+                        # previous sentence open, so it was never written down.
+                        to_notes(bytes(len(frame)))
                         continue
 
                     n += 1
@@ -799,6 +803,7 @@ async def handle_phone(esp):
                         dropped += len(frame)
                         stats["echo_s"] = dropped / 2 / RATE
                         state["muted"] = True
+                        to_notes(bytes(len(frame)))   # see the phone path: silence, not nothing
                         continue
                     state["muted"] = False
                     a = np.frombuffer(frame, dtype=np.int16).astype(np.float32)

@@ -271,7 +271,11 @@ async def test_call(clips: dict):
                   and not dash.stats.get("agent"), "no reconnect")
 
         # --- the dashboard's Hang up button ends a call too
-        async with websockets.connect(f"{WS}/", max_size=None) as phone_ws:
+        # This phone never reads, but the relay sends it the greeting. With the
+        # default 16-message queue the client stops reading once it fills, the
+        # relay's close frame sits behind unread audio, and wait_closed() times
+        # out though the call did end. Unbounded queue: the close gets through.
+        async with websockets.connect(f"{WS}/", max_size=None, max_queue=None) as phone_ws:
             await phone_ws.send("fmt:pcm16@24000")
             up = await wait_for(lambda: dash.stats.get("agent"), 15)
             await dash.send(cmd="hangup")

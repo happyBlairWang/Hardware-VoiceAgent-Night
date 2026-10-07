@@ -39,6 +39,10 @@ from urllib.parse import urlencode
 import numpy as np
 import sounddevice as sd
 import websockets
+try:
+    from ddgs import DDGS                 # Furby's window on the world
+except Exception:
+    DDGS = None
 
 AGENT_URL = "wss://agents.assemblyai.com/v1/ws"
 RATE      = 24_000
@@ -46,12 +50,14 @@ WS_PORT   = 8080
 UI_PORT   = 8081
 TAIL_S    = 0.20        # coarse backstop; the ESP32 now owns the real gate
 PROFILE   = "kids"      # "kids" or "operator" -- see PROFILES below
-TO_PHONE  = True        # route the reply to the ESP32 speaker, not the Mac
+TO_PHONE  = False       # default to the USB audio hardware (the reSpeaker).
+                        # Set True only when an ESP32 is the speaker.
 PHONE_RATE = 8000       # what the ESP32 plays; 24k/8k = decimate by 3
-PHONE_VOL  = 0.10        # speaker level, 0.0-1.0 (change and restart the relay)
+PHONE_VOL  = 0.35        # speaker level, 0.0-1.0 (change and restart the relay)
 HERE      = Path(__file__).parent
 LOG       = HERE / "session.jsonl"
 NOTES_LOG = HERE / "notes.jsonl"      # the notetaker's record, one turn per line
+MEMORY    = HERE / "memory.md"        # durable facts, read into EVERY session
 
 # Notes run on AssemblyAI's Streaming API, in parallel with the Voice Agent.
 # The agent is tuned to reply fast; this one is tuned to be RIGHT, and it
@@ -76,11 +82,22 @@ NOTES_PARAMS = {
 # notetaker batches them into 100 ms (2400 samples x 2 bytes) before sending.
 NOTES_CHUNK = 4800
 
-# In notes mode Pip is not listening, so it cannot be asked to come back.
-# The notetaker still is -- so it watches for the name instead. "Pip" is short
-# and gets misheard ("Phil" came back once in testing), so treat it as a
-# convenience; the dashboard toggle is the reliable way back.
-WAKE = re.compile(r"\b(?:hey\s+)?(?:pip|pippa)\b", re.I)
+# In notes mode Furby is not listening, so it cannot be asked to come back.
+# The notetaker still is -- so it watches for the name instead. Two syllables
+# survive transcription far better than one did ("Furby" came back as "Phil"),
+# and near-misses are matched too; the dashboard toggle stays the sure way back.
+# Must be an ADDRESS, not a mention. With the "hey" optional, a passing
+# "...a Furby that Devin bought" in the room woke it -- and at a Furby workshop
+# the name comes up constantly. Two forms count:
+#   "hey / ok / hi Furby" anywhere in the turn, or
+#   "Furby," opening the turn. The notetaker's formatter punctuates a direct
+#   address ("Furby, wake up") but not a mention ("Furby workshop starts at
+#   six"), so the comma is what tells them apart. Checked against real
+#   streaming transcripts, not just strings typed by hand.
+_NAME = r"(?:furby|furbie|ferby|firby)"
+WAKE = re.compile(
+    rf"\b(?:hey|ok|okay|hi|hello)[\s,]+{_NAME}\b|^\W*{_NAME}\s*[,!?]",
+    re.I)
 
 # ---------------------------------------------------------------- notes chat
 # Ask questions of your notes, Granola-style, through AssemblyAI's LLM Gateway:
@@ -119,12 +136,18 @@ TESTLOG   = HERE / "tests.jsonl"
 PROFILES = {
     "kids": {
         "voice": "mary",
-        "name": "Pip",
-        "greeting": "Hello there! Pip speaking. What would you like to talk about?",
+        "name": "Furby",
+        "greeting": "Hello there! Furby speaking. What would you like to talk about?",
         "system_prompt": (
-            "Your name is Pip. You are a friendly voice on a magic telephone "
+            "Your name is Furby. You are a friendly voice on a magic telephone "
             "that children call. You are warm, patient and playful.\n"
-            "- If a child asks you to be louder or quieter, or to change the "
+            "- To remember something from an earlier conversation, use "
+            "recall_notes, then say what you found and when it was said.\n"
+            "- You can look things up with search_web. Use it for anything about "
+            "today, or any fact you are unsure of, instead of guessing. Then say "
+            "the answer in one or two simple sentences: never read out web "
+            "addresses, and never list several results.\n"
+                        "- If a child asks you to be louder or quieter, or to change the "
             "volume, use your volume tools and then say what you did in a few "
             "words.\n"
             "Always follow these rules:\n"
@@ -169,6 +192,39 @@ NAME  = _p.get("name", "Operator")
 TOOLS = [
     {
         "type": "function",
+        "name": "remember",
+        "description": ("Save something worth knowing in future calls - a "
+                        "birthday, an appointment, a preference, someone's "
+                        "name. Use it whenever you are told something that "
+                        "will still be true tomorrow."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {"type": "string",
+                         "description": "The thing to remember, in a short sentence."},
+                "when": {"type": "string",
+                         "description": "A date or time if there is one, else empty."},
+            },
+            "required": ["fact"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "recall_notes",
+        "description": ("Look up what was said in earlier conversations - the notes "
+                        "this phone has taken. Use for 'when is...', 'what did I say "
+                        "about...', 'did I mention...', 'remind me what...'. Returns a "
+                        "short answer that says when it was said."),
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {
+                "type": "string",
+                "description": "What to look up, in plain words."}},
+            "required": ["question"],
+        },
+    },
+    {
+        "type": "function",
         "name": "start_listening",
         "description": ("Stop talking and quietly take notes instead. Use when "
                         "someone says 'just listen', 'take notes', 'be quiet for "
@@ -176,6 +232,21 @@ TOOLS = [
                         "first. You will not hear anything until someone says your "
                         "name again."),
         "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "search_web",
+        "description": ("Look something up on the internet. Use it for anything "
+                        "about today - news, weather, scores, when something "
+                        "happens - or any fact you are unsure of. Not needed "
+                        "for ordinary chat."),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {
+                "type": "string",
+                "description": "What to search for, in a few plain words."}},
+            "required": ["query"],
+        },
     },
     {
         "type": "function",
@@ -208,6 +279,8 @@ TOOLS = [
 SESSION = {
     "type": "session.update",
     "session": {
+        # filled in per call by with_facts(); the base prompt alone is a
+        # session that has forgotten everything.
         "system_prompt": _p["system_prompt"],
         "greeting": _p["greeting"],
         "tools": TOOLS,
@@ -253,16 +326,36 @@ state = {"esp": False, "agent": False, "muted": False}
 esp_ws  = None                      # the phone's socket, when it is connected
 capture = None                      # collects mic audio during an echo test
 runtime = {"vol": PHONE_VOL, "to_phone": TO_PHONE, "gate": True,
-           "mic": "phone",          # "phone" = MAX9814, "mac" = built-in
-           "mode": "talk",          # "talk" = Pip answers + notes; "notes" = listen only
-           "pending_mode": None}    # a switch waiting for Pip to finish speaking
+           "mic": "mac",            # "mac" = the attached USB audio device
+                                    # (the reSpeaker); "phone" = an ESP32
+           "mode": "talk",          # "talk" = Furby answers + notes; "notes" = listen only
+           "pending_mode": None}    # a switch waiting for Furby to finish speaking
 
 # The Mac's microphone, as a fallback source. The stream always runs; the
 # callback only queues audio while that source is selected, so switching is
 # instant and does not need the device re-opened.
 mic_q: "queue.Queue[bytes]" = queue.Queue(maxsize=120)
 
+call_hangup: "asyncio.Event | None" = None      # set to end the current call
+
+
+def mic_frame(timeout: float = 0.5):
+    """Next frame from the Mac's mic, or None after a short wait. A bare
+    mic_q.get() parks a worker thread until a frame arrives -- which, once the
+    call is over or another mic is selected, is never. One would strand per
+    call, from the same pool the notes chat streams through."""
+    try:
+        return mic_q.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+mic_seen = time.monotonic()        # last time the Mac mic delivered anything
+
+
 def on_mac_mic(indata, frames, time_info, status):
+    global mic_seen
+    mic_seen = time.monotonic()
     if runtime["mic"] != "mac":
         return
     try:
@@ -339,8 +432,47 @@ async def echo_test(seconds: float = 3.0):
 
 async def run_tool(name: str, args: dict) -> dict:
     """Apply a tool the agent invoked. Returns whatever it should hear back."""
+    if name == "remember":
+        fact = str(args.get("fact", "")).strip()
+        if not fact:
+            return {"error": "nothing given to remember"}
+        line = save_fact(fact, str(args.get("when", "")))
+        print(f"  [tool] remember {line}", flush=True)
+        await to_ui({"type": "note", "text": f"{NAME} will remember: {fact}"})
+        kept = sum(1 for l in load_memory().splitlines() if l.lstrip().startswith("-"))
+        return {"saved": line, "total_known": kept}
+
+    if name == "recall_notes":
+        q = str(args.get("question", "")).strip()
+        if not q:
+            return {"error": "no question given"}
+        print(f"  [tool] recall_notes {q!r}", flush=True)
+        await to_ui({"type": "note", "text": f"{NAME} checked the notes: {q}"})
+        return await asyncio.get_running_loop().run_in_executor(None, recall, q)
+
+    if name == "search_web":
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return {"error": "no query given"}
+        if DDGS is None:
+            return {"error": "search is unavailable on this machine"}
+        print(f"  [tool] search_web {q!r}", flush=True)
+        await to_ui({"type": "note", "text": f"{NAME} looked up: {q}"})
+        try:
+            # safesearch stays on: this agent talks to children.
+            rows = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: DDGS().text(q, max_results=3, safesearch="on"))
+        except Exception as e:
+            return {"error": f"search failed: {e}"}
+        if not rows:
+            return {"results": [], "note": "nothing found"}
+        # Kept short: every word of this ends up spoken aloud.
+        return {"results": [{"title": r.get("title", "")[:90],
+                             "summary": r.get("body", "")[:220]}
+                            for r in rows[:3]]}
+
     if name == "start_listening":
-        # Defer the switch until Pip finishes its goodbye: switching now would
+        # Defer the switch until Furby finishes its goodbye: switching now would
         # discard the very reply that says it. Applied on the next reply.done,
         # with a fallback in case no reply comes.
         runtime["pending_mode"] = "notes"
@@ -372,9 +504,59 @@ async def run_tool(name: str, args: dict) -> dict:
     return {"volume_percent": pct}
 
 
+def load_memory() -> str:
+    """Durable things worth knowing between calls.
+
+    Markdown, not JSON: this file is curated by hand, it goes into the prompt
+    verbatim with no conversion, and nothing here needs escaping. The
+    notetaker's transcript is a record of what was SAID; this is the short list
+    of what stays TRUE afterwards.
+    """
+    if not MEMORY.exists():
+        return ""
+    try:
+        return MEMORY.read_text().strip()
+    except Exception:
+        return ""
+
+
+def save_fact(text: str, when: str = "") -> str:
+    """Append one bullet. Restating something replaces the old line rather
+    than stacking a near-duplicate."""
+    text, when = text.strip().rstrip("."), when.strip()
+    # The model often puts the date in both fields ("on March third. — March
+    # third"); only append `when` if the sentence doesn't already say it.
+    if when and when.lower() in text.lower():
+        when = ""
+    line = f"- {text}" + (f" — {when}" if when else "")
+    body = load_memory()
+    if not body:
+        body = "# What Furby remembers\n"
+    key = text.strip().lower()[:40]
+    kept = [l for l in body.splitlines()
+            if not (l.lstrip().startswith("-") and key in l.lower())]
+    kept.append(line)
+    MEMORY.write_text("\n".join(kept).rstrip() + "\n")
+    return line
+
+
+def facts_block() -> str:
+    body = load_memory()
+    if not body:
+        return ""
+    today = time.strftime("%A %-d %B %Y")
+    return (f"Today is {today}.\n\n{body}\n\n"
+            "Use these naturally when relevant. Do not recite the whole list "
+            "unless you are asked what you remember.\n"
+            "If someone tells you something that contradicts the list above - a "
+            "different date, say - politely correct them and give the date you "
+            "have. Do not simply agree, and do not claim not to know something "
+            "that is written above.")
+
+
 def record_note(src: str, speaker: str, text: str, conf: float | None = None):
     """One finished turn of notes. `src` is "mic" (the notetaker heard it) or
-    "agent" (Pip said it -- taken from the agent's own clean transcript rather
+    "agent" (Furby said it -- taken from the agent's own clean transcript rather
     than re-transcribed off the speaker)."""
     row = {"t": time.time(), "src": src, "speaker": speaker, "text": text}
     if conf is not None:
@@ -390,7 +572,7 @@ async def set_mode(mode: str, why: str = ""):
         return
     runtime["mode"] = mode
     if mode == "notes":
-        # Stop anything Pip was mid-way through saying. A reply already being
+        # Stop anything Furby was mid-way through saying. A reply already being
         # generated would otherwise finish playing after the switch.
         while not spk_q.empty():
             spk_q.get_nowait()
@@ -400,10 +582,27 @@ async def set_mode(mode: str, why: str = ""):
                 await esp_ws.send("flush")
             except Exception:
                 pass
-    label = "talking - Pip answers" if mode == "talk" else "listening - notes only"
+    label = "talking - Furby answers" if mode == "talk" else "listening - notes only"
     print(f"  [mode] {label}{f'  ({why})' if why else ''}", flush=True)
     await to_ui({"type": "note", "text": f"now {label}"})
     await to_ui({"type": "mode", "mode": mode})
+
+
+async def mic_watch():
+    """The Mac mic stream delivers constantly while it's alive. When a USB audio
+    device is plugged in or out, macOS's audio layer errors (-50) and the stream
+    just stops -- silently, so calls hear nothing. Say so instead."""
+    warned = False
+    while True:
+        await asyncio.sleep(2)
+        dead = time.monotonic() - mic_seen > 4
+        if dead and not warned:
+            print("  !! the Mac microphone stopped delivering audio - probably a "
+                  "device was plugged in or out. Restart the relay (./phone).", flush=True)
+            await to_ui({"type": "note", "text":
+                         "Mac microphone stopped - a device was plugged in or out. "
+                         "Restart the relay to fix it."})
+        warned = dead
 
 
 async def telemetry():
@@ -414,6 +613,7 @@ async def telemetry():
                          "vol": runtime["vol"], "profile": PROFILE, "voice": VOICE,
                          "to_phone": runtime["to_phone"], "gate": runtime["gate"],
                          "mic": runtime["mic"], "mode": runtime["mode"],
+                         "device": runtime.get("device", "Mac"),
                          "notes_live": state.get("notes", False)})
 
 async def to_ui(msg: dict):
@@ -450,6 +650,7 @@ def pick_device(want: str = "reSpeaker"):
                 ins  = i if d["max_input_channels"]  > 0 else None
                 outs = i if d["max_output_channels"] > 0 else None
                 print(f"audio  using '{d['name']}' (device {i})", flush=True)
+                runtime["device"] = d["name"]
                 return ins, outs
     except Exception:
         pass
@@ -478,9 +679,16 @@ async def handle_phone(esp):
     #   "fmt:pcm16@24000"  NS4168 over I2S          -> pass 16-bit straight through
     fmt = {"bits": 8, "rate": 8000}
     state["esp"] = esp is not None
+    # Use whatever placed the call. The USB hardware (reSpeaker) is the default
+    # for a phoneless call; a phone that dials in brings its own mic and
+    # speaker. Defaulting everything to the USB device dropped a phone's audio
+    # on the floor and sent its replies to the Mac instead.
     if esp is None:
         runtime["mic"] = "mac"          # there is no phone mic to use
         runtime["to_phone"] = False     # ...and nowhere to send audio but here
+    else:
+        runtime["mic"] = "phone"
+        runtime["to_phone"] = True
     await push_status()
     who = esp.remote_address[0] if esp is not None else "the Mac (no phone)"
     print(f"\n=== call started from {who} ===", flush=True)
@@ -491,14 +699,21 @@ async def handle_phone(esp):
             AGENT_URL, additional_headers={"Authorization": f"Bearer {load_key()}"},
             max_size=None,
         ) as agent:
-            await agent.send(json.dumps(SESSION))
+            session = json.loads(json.dumps(SESSION))      # never mutate the base
+            block = facts_block()
+            if block:
+                session["session"]["system_prompt"] += "\n\n" + block
+            once = runtime.pop("once_greeting", None)
+            if once:
+                session["session"]["greeting"] = once
+            await agent.send(json.dumps(session))
             ready = asyncio.Event()
             line: list[str] = []
             sent = dropped = 0
             speak_until = 0.0        # monotonic time the speakers fall silent
 
             # Audio for the notetaker. Bounded so a stalled notes connection
-            # drops frames instead of growing without limit or blocking Pip.
+            # drops frames instead of growing without limit or blocking Furby.
             notes_q: asyncio.Queue = asyncio.Queue(maxsize=400)
 
             def to_notes(frame: bytes):
@@ -558,10 +773,10 @@ async def handle_phone(esp):
                         await to_ui({"type": "level", "rms": stats["rms"]})
 
                     # Fan out. Echo-gated frames never reach here, so neither
-                    # stream transcribes Pip's own voice off the speaker.
+                    # stream transcribes Furby's own voice off the speaker.
                     to_notes(frame)                   # the notetaker always hears
                     if runtime["mode"] != "talk":
-                        continue                      # Pip only hears in talk mode
+                        continue                      # Furby only hears in talk mode
                     sent += len(frame)
                     stats["sent_s"] = sent / 2 / RATE
                     await agent.send(json.dumps({
@@ -577,8 +792,8 @@ async def handle_phone(esp):
                 await ready.wait()
                 loop = asyncio.get_running_loop()
                 while True:
-                    frame = await loop.run_in_executor(None, mic_q.get)
-                    if runtime["mic"] != "mac":
+                    frame = await loop.run_in_executor(None, mic_frame)
+                    if frame is None or runtime["mic"] != "mac":
                         continue
                     if runtime["gate"] and time.monotonic() < speak_until + TAIL_S:
                         dropped += len(frame)
@@ -606,7 +821,7 @@ async def handle_phone(esp):
 
                     if t == "reply.audio":
                         if runtime["mode"] == "notes":
-                            continue        # listening only: Pip stays silent
+                            continue        # listening only: Furby stays silent
                         pcm = base64.b64decode(m["data"])
                         if runtime["to_phone"]:
                             a = np.frombuffer(pcm, dtype=np.int16)
@@ -642,7 +857,7 @@ async def handle_phone(esp):
                             record("operator", said)
                             stats["turns"] += 1
                             await to_ui({"type": "agent", "text": said})
-                            # Pip's side of the notes comes from its own clean
+                            # Furby's side of the notes comes from its own clean
                             # transcript, not re-transcribed off the speaker.
                             row = record_note("agent", NAME, said)
                             await to_ui({"type": "note_turn", **row})
@@ -764,12 +979,26 @@ async def handle_phone(esp):
             # would outlive the call: gather does not cancel siblings when one
             # fails, so a dead call would leave a billed stream reconnecting.
             notes_task = asyncio.create_task(notes_stream())
+            hangup = asyncio.Event()
+            globals()["call_hangup"] = hangup
+            legs = [asyncio.create_task(c) for c in
+                    (esp_to_agent(), mac_to_agent(), agent_to_out(), hangup.wait())]
             try:
-                await asyncio.gather(esp_to_agent(), mac_to_agent(), agent_to_out())
-            except websockets.ConnectionClosed:
-                pass
+                # The call ends when ANY leg does: the phone hangs up, the agent
+                # closes, a leg fails, or someone presses hang-up. gather() waited
+                # for all of them -- and mac_to_agent never finishes -- so a call
+                # never actually ended, and kept its agent session and notetaker
+                # running (and billed) until the relay restarted.
+                done, _ = await asyncio.wait(legs, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    err = t.exception()
+                    if err and not isinstance(err, websockets.ConnectionClosed):
+                        print(f"  call ended by a failure: {err!r}", flush=True)
             finally:
+                for t in legs:
+                    t.cancel()
                 notes_task.cancel()
+                globals()["call_hangup"] = None
                 record("_call", "end")
                 print(f"=== hung up ({sent/2/RATE:.1f}s sent, "
                       f"{dropped/2/RATE:.1f}s muted as echo) ===", flush=True)
@@ -857,6 +1086,35 @@ def _stream_chat(key: str, body: dict, stop: threading.Event, on_delta) -> str |
         return f"{e.code}: {why}"
     except Exception as e:
         return f"{type(e).__name__}: {e}"
+
+
+RECALL_SYSTEM = """You look things up in the notes a talking telephone has taken, so \
+its assistant can say the answer aloud. Today is {today}.
+- Reply in one or two short sentences a child could follow.
+- Say when it was said in spoken words, like "on September fifteenth". Never use \
+brackets, slashes or numeric dates - every word is read out loud.
+- If the notes don't say, reply exactly: I don't have a note about that."""
+
+
+def recall(question: str) -> dict:
+    """Worker thread: answer one question from the notes, phrased for speech."""
+    ctx, total, _ = notes_context()
+    if not total:
+        return {"answer": "I don't have any notes yet."}
+    body = {"model": LLM_DEFAULT, "max_tokens": 150, "messages": [
+        {"role": "system", "content": RECALL_SYSTEM.format(
+            today=time.strftime("%A %B %d %Y")) + "\n\nNOTES:\n" + ctx},
+        {"role": "user", "content": question}]}
+    req = urllib.request.Request(
+        f"{LLM_BASE}/chat/completions", data=json.dumps(body).encode(), method="POST",
+        headers={"authorization": load_key(), "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            text = json.load(r)["choices"][0]["message"]["content"].strip()
+        print(f"  [recall] {text}", flush=True)
+        return {"answer": text}
+    except Exception as e:
+        return {"error": f"could not read the notes: {e}"}
 
 
 _chat_stops: dict[str, threading.Event] = {}
@@ -956,13 +1214,23 @@ async def handle_ui(ws):
                 record_test("sweep", ok, f"200 Hz -> 3 kHz at {v:.0%}")
             elif c == "echo":
                 asyncio.create_task(echo_test())
+            elif c == "announce":
+                text = str(m.get("text", "")).strip()
+                if not text:
+                    await to_ui({"type": "note", "text": "nothing to announce"})
+                elif state["esp"] or state["agent"]:
+                    await to_ui({"type": "note", "text": "a call is already open"})
+                else:
+                    runtime["once_greeting"] = text
+                    asyncio.create_task(handle_phone(None))
             elif c == "call":
                 if state["esp"] or state["agent"]:
                     await to_ui({"type": "note", "text": "a call is already open"})
                 else:
                     asyncio.create_task(handle_phone(None))
             elif c == "hangup":
-                globals()["hangup_flag"] = True
+                if call_hangup is not None:
+                    call_hangup.set()
             elif c == "mode":
                 await set_mode(m.get("value", ""), why="dashboard")
             elif c == "mic":
@@ -975,7 +1243,16 @@ async def handle_ui(ws):
                     print(f"  [mic] source -> {v2}", flush=True)
                     await to_ui({"type": "note", "text": f"listening through {label}"})
             elif c == "volume":
-                runtime["vol"] = max(0.0, min(1.0, float(m.get("value", 0.5))))
+                try:
+                    want = float(m.get("value", 0.5))
+                except (TypeError, ValueError):
+                    await to_ui({"type": "note", "text": "volume must be a number 0-1"})
+                    continue
+                runtime["vol"] = max(0.0, min(1.0, want))
+                if runtime["vol"] != want:
+                    await to_ui({"type": "note",
+                                 "text": f"volume {want} is outside 0-1; set to "
+                                         f"{runtime['vol']:.0%}"})
             elif c == "output":
                 runtime["to_phone"] = (m.get("value") == "phone")
                 where = "phone speaker" if runtime["to_phone"] else "Mac speakers"
@@ -1051,21 +1328,33 @@ def serve_page():
 async def main():
     load_key()
     threading.Thread(target=serve_page, daemon=True).start()
-    try:
-        dev_in, dev_out = pick_device()
-        mac_in = sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                blocksize=1200, callback=on_mac_mic,
-                                device=dev_in)
-        mac_in.start()
-        mac_ok = True
-    except Exception as e:
-        mac_in, mac_ok = None, False
-        print(f"mac mic unavailable ({e}) - phone mic only", flush=True)
+    # CoreAudio does not release a USB device instantly. Restarting the relay
+    # can hit the old instance's handle and fail with a host error, which used
+    # to leave the microphone dead for the whole session. Retry briefly.
+    mac_in, mac_ok = None, False
+    dev_in, dev_out = pick_device()
+    for attempt in range(4):
+        try:
+            mac_in = sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                                    blocksize=1200, callback=on_mac_mic,
+                                    device=dev_in)
+            mac_in.start()
+            mac_ok = True
+            break
+        except Exception as e:
+            if attempt == 3:
+                print(f"mac mic unavailable after 4 tries ({e}) - phone mic only",
+                      flush=True)
+            else:
+                time.sleep(0.8)
+
 
     with sd.OutputStream(samplerate=RATE, channels=1, dtype="int16",
                          blocksize=1200, callback=on_speaker,
                          device=dev_out):
         asyncio.create_task(telemetry())
+        if mac_ok:
+            asyncio.create_task(mic_watch())
         async with websockets.serve(router, "0.0.0.0", WS_PORT, max_size=None):
             print(f"relay  ws://0.0.0.0:{WS_PORT}", flush=True)
             print(f"UI     http://localhost:{UI_PORT}/ui.html", flush=True)

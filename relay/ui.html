@@ -66,15 +66,6 @@ button:focus-visible{outline:2px solid var(--brass);outline-offset:2px}
 /* volume */
 input[type=range]{width:100%;accent-color:var(--brass)}
 
-/* camera */
-.cam{position:relative;border:1px solid var(--line);border-radius:2px;background:var(--sunk);
-aspect-ratio:4/3;overflow:hidden;margin-bottom:6px}
-.cam img{width:100%;height:100%;object-fit:cover;display:none}
-.cam img.on{display:block}
-.cam-none{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.06em}
-.cam-none.gone{display:none}
-
 /* segmented source switch */
 .seg{display:flex;margin-bottom:14px;border:1px solid var(--line);border-radius:2px;overflow:hidden}
 .seg button{flex:1;border:0;border-radius:0;background:var(--sunk);padding:9px 6px;font-size:11.5px}
@@ -160,7 +151,7 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
   display:flex;gap:18px;flex-wrap:wrap}
 /* ---- mode + notes ---- */
 .mode-hint{font-size:11.5px;color:var(--faint);line-height:1.5;margin:10px 0 0}
-body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. Say \201cPip\201d or press Talk to bring it back.";
+body.listening .feed#feed::before{content:"Listening only \2014  Furby is muted. Say \201cHey Furby\201d  or press Talk to bring it back.";
   display:block;padding:10px 14px;margin-bottom:6px;border:1px dashed var(--brass);
   color:var(--brass);font-size:12.5px;border-radius:2px}
 .tab .badge{display:inline-block;min-width:16px;padding:0 5px;margin-left:6px;border-radius:8px;
@@ -225,6 +216,8 @@ body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. S
   font:inherit;padding:4px 6px;max-width:260px}
 .cmeta .grow{flex:1}
 .cmeta button{padding:4px 10px;font-size:10.5px}
+button.end{border-color:var(--bad);color:var(--bad)}
+button.end:hover:not(:disabled){border-color:var(--bad);color:var(--bad);background:#2A1714}
 </style>
 
 <header>
@@ -241,20 +234,12 @@ body.listening .feed#feed::before{content:"Listening only \2014  Pip is muted. S
 <div class="grid">
 <aside>
   <div class="blk">
-    <h2>Camera</h2>
-    <div class="cam" id="cam-wrap">
-      <img id="cam" alt="live view from the phone's camera">
-      <div class="cam-none" id="cam-none">no frames yet</div>
-    </div>
-  </div>
-
-  <div class="blk">
     <h2>Mode</h2>
     <div class="seg" id="mode-seg">
       <button class="on" data-mode="talk">Talk + notes</button>
       <button data-mode="notes">Notes only</button>
     </div>
-    <p class="mode-hint" id="mode-hint">Pip answers, and every turn is also written to Notes.</p>
+    <p class="mode-hint" id="mode-hint">Furby answers, and every turn is also written to Notes.</p>
   </div>
 
   <div class="blk">
@@ -591,8 +576,8 @@ function showMode(mode) {
     b.classList.toggle('on', b.dataset.mode === mode));
   document.body.classList.toggle('listening', mode === 'notes');
   $('mode-hint').textContent = mode === 'notes'
-    ? 'Pip is muted and only notes are taken. Say \u201cPip\u201d to talk again.'
-    : 'Pip answers, and every turn is also written to Notes.';
+    ? 'Furby is muted and only notes are taken. Say \u201cHey Furby\u201d to talk again.'
+    : 'Furby answers, and every turn is also written to Notes.';
 }
 document.querySelectorAll('#mode-seg button').forEach(b =>
   b.addEventListener('click', () => send('mode', { value: b.dataset.mode })));
@@ -806,10 +791,9 @@ function connect() {
     const m = JSON.parse(ev.data);
 
     if (m.type === 'image') {
-      const img = document.getElementById('cam');
-      img.src = 'data:image/jpeg;base64,' + m.data;
-      img.classList.add('on');
-      document.getElementById('cam-none').classList.add('gone');
+      // No camera panel any more. The relay still forwards frames when a XIAO
+      // with a camera is attached, so drop them here: the catch-all at the end
+      // of this chain would otherwise put each one in the conversation.
 
     } else if (m.type === 'level') {
       level(m.rms);
@@ -827,7 +811,14 @@ function connect() {
       const canPlay = !!(m.esp || !m.to_phone);   // some speaker is reachable
       document.querySelectorAll('button[data-cmd]').forEach(b => {
         const c = b.dataset.cmd;
-        if (c === 'call')        b.disabled = live;        // only when idle
+        if (c === 'call' || c === 'hangup') {
+          // One button: start a laptop call when idle, end the call when live.
+          // It used to just grey out mid-call, leaving no way to hang up.
+          b.dataset.cmd = live ? 'hangup' : 'call';
+          b.textContent = live ? 'Hang up' : 'Start a call (no phone)';
+          b.classList.toggle('end', live);
+          b.disabled = false;
+        }
         else if (c === 'clear')  b.disabled = false;
         else                     b.disabled = !canPlay;
       });
@@ -860,9 +851,20 @@ function connect() {
             b.classList.toggle('on',
               (b.dataset.out === 'phone') === m.to_phone));
         }
+        if (m.device) {
+          // "Mac speakers" is whatever audio device the relay picked, which is
+          // usually the reSpeaker. Say so rather than making the user guess.
+          const short = m.device.replace(/\s*\(.*\)$/, '').split(' ').slice(0, 2).join(' ');
+          const out = document.querySelector('[data-out="mac"]');
+          const mic = document.querySelector('#mic-seg [data-mic="mac"]');
+          if (out) out.textContent = short;
+          if (mic) mic.textContent = short;
+        }
         if (m.mic) {
           document.querySelectorAll('#mic-seg button').forEach(b =>
             b.classList.toggle('on', b.dataset.mic === m.mic));
+          document.querySelectorAll('#mic-seg button').forEach(b =>
+            b.disabled = !m.esp && b.dataset.mic === 'phone');
           $('mic-lab').textContent = m.mic === 'mac' ? 'Level · Mac mic'
                                                      : 'Level · onboard PDM';
         }

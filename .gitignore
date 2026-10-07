@@ -18,3 +18,7 @@ relay/notes.jsonl
 # Seeed's XVF3800 firmware images - 3.5 MB of vendor binaries that are
 # versioned upstream. firmware/xvf3800/README.md says how to fetch them.
 firmware/xvf3800/*.bin
+
+# Furby's memory: real personal facts, rewritten at runtime by the "remember"
+# tool. relay/memory.example.md shows the shape; copy it to memory.md.
+relay/memory.md

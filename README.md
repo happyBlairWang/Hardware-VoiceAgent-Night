@@ -3,6 +3,11 @@
 A 1955 rotary telephone answering as a voice agent. You speak into the handset;
 AssemblyAI's Voice Agent API answers through the earpiece.
 
+**Building one yourself?** Start with [`SKILL.md`](SKILL.md): a step-by-step
+build with Claude Code, from laptop-only to hardware, plus the failures that give
+no error message. Claude Code loads it automatically in this repo; the workshop
+walk-through is in [`workshop/`](workshop/README.md).
+
 ## How it fits together
 
     MAX9814 mic -> ESP32 (GPIO34, ADC1) -> WiFi -> relay on a Mac -> AssemblyAI

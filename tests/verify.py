@@ -74,6 +74,17 @@ def test_repo():
     tracked = set(git("ls-files").split())
     for f in ("relay/.env", "src/secrets.h", "relay/notes.jsonl", "relay/session.jsonl"):
         check(f"{f} is not tracked", f not in tracked)
+    check("relay/memory.md is not tracked", "relay/memory.md" not in tracked)
+
+    # The skill lives at the repo root (visible, installable from GitHub) and is
+    # mirrored into .claude/skills/ so Claude Code loads it automatically for
+    # anyone who clones. The mirror must not drift from the original.
+    mirror = ROOT / ".claude/skills/build-voice-agent"
+    for rel in ("SKILL.md", "references/api-contracts.md", "references/hardware.md"):
+        a, b = ROOT / rel, mirror / rel
+        same = a.exists() and b.exists() and a.read_bytes() == b.read_bytes()
+        check(f"skill mirror matches: {rel}", same,
+              "" if same else f"run: cp {rel} .claude/skills/build-voice-agent/{rel}")
 
     # Search every commit ever made -- not just the current tree -- for the real
     # values, read from the gitignored files. Nothing secret is stored here.

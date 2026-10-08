@@ -4,6 +4,10 @@
 #   ./phone bg       run detached, logging to /tmp/relay.log
 cd "$(dirname "$0")/relay" || exit 1
 pkill -f "relay.py" 2>/dev/null && sleep 1
+# python.org builds of Python ship no root certificates, so every wss:// connect
+# fails with CERTIFICATE_VERIFY_FAILED. Point OpenSSL at certifi's bundle instead.
+CERTS=$("$HOME/esp-tools/bin/python" -c "import certifi; print(certifi.where())" 2>/dev/null)
+[ -n "$CERTS" ] && export SSL_CERT_FILE="$CERTS"
 if [ "$1" = "bg" ]; then
   nohup "$HOME/esp-tools/bin/python" -u relay.py > /tmp/relay.log 2>&1 &
   sleep 4

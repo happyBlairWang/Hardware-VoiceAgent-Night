@@ -1,6 +1,6 @@
-# What Furby remembers
+# What Luna remembers
 
-Copy this to `memory.md` and edit it, or say "Furby, remember ..." and it
+Copy this to `memory.md` and edit it, or say "Luna, remember ..." and it
 appends here. The whole file is added to every session's prompt, so keep it
 short. `memory.md` is gitignored: it holds real personal facts.
 

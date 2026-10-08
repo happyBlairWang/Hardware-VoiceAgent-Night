@@ -49,7 +49,7 @@ RATE      = 24_000
 WS_PORT   = 8080
 UI_PORT   = 8081
 TAIL_S    = 0.20        # coarse backstop; the ESP32 now owns the real gate
-PROFILE   = "kids"      # "kids" or "operator" -- see PROFILES below
+PROFILE   = "luna"      # "luna", "kids" or "operator" -- see PROFILES below
 TO_PHONE  = False       # default to the USB audio hardware (the reSpeaker).
                         # Set True only when an ESP32 is the speaker.
 PHONE_RATE = 8000       # what the ESP32 plays; 24k/8k = decimate by 3
@@ -94,7 +94,7 @@ NOTES_CHUNK = 4800
 #   address ("Furby, wake up") but not a mention ("Furby workshop starts at
 #   six"), so the comma is what tells them apart. Checked against real
 #   streaming transcripts, not just strings typed by hand.
-_NAME = r"(?:furby|furbie|ferby|firby)"
+_NAME = r"(?:luna|lunar|loona|louna)"
 WAKE = re.compile(
     rf"\b(?:hey|ok|okay|hi|hello)[\s,]+{_NAME}\b|^\W*{_NAME}\s*[,!?]",
     re.I)
@@ -110,7 +110,7 @@ WAKE = re.compile(
 #         model, qwen3.5-4b-fast, is not in it: 400 "model ... is not supported".
 #   "stream": true gives OpenAI-style SSE: "data: {...}" lines, then "data: [DONE]"
 LLM_BASE = "https://llm-gateway.assemblyai.com/v1"
-LLM_DEFAULT = "claude-haiku-4-5-20251001"      # quick enough to feel like chat
+LLM_DEFAULT = "qwen3.5-4b-32k-fast"            # the one model this account can use on LLM Gateway
 LLM_PREFERRED = [                               # shown first, if still offered
     "claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5-5",
     "gpt-5-mini", "gpt-5.5", "gemini-3.5-flash", "qwen3.5-4b-32k-fast",
@@ -134,6 +134,56 @@ TESTLOG   = HERE / "tests.jsonl"
 # Two personalities. Switch with PROFILE above; the voice is fixed for the
 # life of a session, so changing either one means restarting the relay.
 PROFILES = {
+    "luna": {
+        "voice": "jane",
+        "name": "Luna",
+        "greeting": "Hi, I'm Luna. I'm here and I'm listening. What's on your mind?",
+        "system_prompt": (
+            "Your name is Luna. You are a warm, compassionate voice on a telephone "
+            "that people call when they want to talk something through, think out "
+            "loud, or simply be heard.\n"
+            "How you listen:\n"
+            "- You never judge. Whatever someone tells you - a mistake, a fear, "
+            "something they are ashamed of - you meet it with acceptance, not "
+            "evaluation. No lectures, no 'you should have'.\n"
+            "- Reflect before you respond: briefly name what you heard and the "
+            "feeling underneath it, so the person knows they were understood.\n"
+            "- Ask one gentle, open question at a time. Let them lead; follow "
+            "what matters to them, not what you find interesting.\n"
+            "- Offer advice only when asked. If they want ideas, offer one or two "
+            "and ask what fits them, instead of handing down a plan.\n"
+            "- Be honest and real. Compassion is not flattery: if asked directly "
+            "for your view, give it kindly and plainly.\n"
+            "- Silence and pauses are fine. If someone trails off, wait or gently "
+            "ask if they want to say more. If you did not understand, ask them "
+            "to say it again rather than guessing.\n"
+            "How you speak:\n"
+            "- This is a phone call. Keep most replies to two or three natural "
+            "sentences; go longer only when they clearly want you to.\n"
+            "- Plain, everyday language. No bullet points, no headings, no "
+            "therapy jargon, never read out web addresses.\n"
+            "Your tools:\n"
+            "- To recall an earlier conversation, use recall_notes, then say what "
+            "you found and when it was said.\n"
+            "- When someone tells you something that will still matter tomorrow - "
+            "a name, a date, a decision, something they care about - use remember, "
+            "and say in a few words that you will keep it in mind.\n"
+            "- For anything about today or any fact you are unsure of, use "
+            "search_web rather than guessing, then give the answer in a sentence "
+            "or two.\n"
+            "- If asked to be louder or quieter, use your volume tools and briefly "
+            "say what you did.\n"
+            "Care and limits:\n"
+            "- You are a caring voice, not a therapist or doctor, and you say so "
+            "if someone asks you to be one.\n"
+            "- If someone speaks of hurting themselves, of being hurt, or of being "
+            "in danger right now, stay with them, take it seriously, and warmly "
+            "encourage them to reach a person they trust or their local emergency "
+            "or crisis line straight away. Do not change the subject.\n"
+            "- Never ask for private details you do not need, such as an address "
+            "or phone number."
+        ),
+    },
     "kids": {
         "voice": "mary",
         "name": "Furby",
@@ -531,7 +581,7 @@ def save_fact(text: str, when: str = "") -> str:
     line = f"- {text}" + (f" — {when}" if when else "")
     body = load_memory()
     if not body:
-        body = "# What Furby remembers\n"
+        body = f"# What {NAME} remembers\n"
     key = text.strip().lower()[:40]
     kept = [l for l in body.splitlines()
             if not (l.lstrip().startswith("-") and key in l.lower())]
@@ -582,7 +632,7 @@ async def set_mode(mode: str, why: str = ""):
                 await esp_ws.send("flush")
             except Exception:
                 pass
-    label = "talking - Furby answers" if mode == "talk" else "listening - notes only"
+    label = f"talking - {NAME} answers" if mode == "talk" else "listening - notes only"
     print(f"  [mode] {label}{f'  ({why})' if why else ''}", flush=True)
     await to_ui({"type": "note", "text": f"now {label}"})
     await to_ui({"type": "mode", "mode": mode})

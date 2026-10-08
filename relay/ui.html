@@ -151,7 +151,7 @@ footer{padding:9px 22px;border-top:1px solid var(--line);
   display:flex;gap:18px;flex-wrap:wrap}
 /* ---- mode + notes ---- */
 .mode-hint{font-size:11.5px;color:var(--faint);line-height:1.5;margin:10px 0 0}
-body.listening .feed#feed::before{content:"Listening only \2014  Furby is muted. Say \201cHey Furby\201d  or press Talk to bring it back.";
+body.listening .feed#feed::before{content:"Listening only \2014  Luna is muted. Say \201cHey Luna\201d  or press Talk to bring it back.";
   display:block;padding:10px 14px;margin-bottom:6px;border:1px dashed var(--brass);
   color:var(--brass);font-size:12.5px;border-radius:2px}
 .tab .badge{display:inline-block;min-width:16px;padding:0 5px;margin-left:6px;border-radius:8px;
@@ -239,7 +239,7 @@ button.end:hover:not(:disabled){border-color:var(--bad);color:var(--bad);backgro
       <button class="on" data-mode="talk">Talk + notes</button>
       <button data-mode="notes">Notes only</button>
     </div>
-    <p class="mode-hint" id="mode-hint">Furby answers, and every turn is also written to Notes.</p>
+    <p class="mode-hint" id="mode-hint">Luna answers, and every turn is also written to Notes.</p>
   </div>
 
   <div class="blk">
@@ -576,8 +576,8 @@ function showMode(mode) {
     b.classList.toggle('on', b.dataset.mode === mode));
   document.body.classList.toggle('listening', mode === 'notes');
   $('mode-hint').textContent = mode === 'notes'
-    ? 'Furby is muted and only notes are taken. Say \u201cHey Furby\u201d to talk again.'
-    : 'Furby answers, and every turn is also written to Notes.';
+    ? 'Luna is muted and only notes are taken. Say \u201cHey Luna\u201d to talk again.'
+    : 'Luna answers, and every turn is also written to Notes.';
 }
 document.querySelectorAll('#mode-seg button').forEach(b =>
   b.addEventListener('click', () => send('mode', { value: b.dataset.mode })));

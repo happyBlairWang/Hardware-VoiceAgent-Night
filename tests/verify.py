@@ -9,7 +9,7 @@ It pretends to be the ESP32 -- streaming synthesized voices into the relay exact
 as the phone does -- so the real code paths run against the live AssemblyAI APIs.
 Results print here and are added to the dashboard's Test log tab.
 
-Your notes, call history and Furby's memory are snapshotted first and restored afterwards, so the
+Your notes, call history and Luna's memory are snapshotted first and restored afterwards, so the
 test calls leave no trace in them. Secrets are read at runtime from the gitignored
 files, never written into this script.
 """
@@ -121,9 +121,9 @@ def make_clips(tmp: Path) -> dict:
     lines = {
         "milk":    ("Samantha", "Remind me to buy milk, and call Grandma on Sunday afternoon."),
         "dentist": ("Daniel",   "Also, the dentist appointment moved to Thursday at three."),
-        "turnup":  ("Samantha", "Furby, please turn the volume up."),
+        "turnup":  ("Samantha", "Luna, please turn the volume up."),
         "quiet":   ("Samantha", "This part should only be written down. Please do not answer it."),
-        "wake":    ("Daniel",   "Hey Furby, are you there?"),
+        "wake":    ("Daniel",   "Hey Luna, are you there?"),
     }
     clips = {}
     for name, (voice, text) in lines.items():
@@ -169,7 +169,7 @@ class Phone:
     async def settle(self, dash=None) -> float:
         """Wait until the reply has finished playing; return its length in seconds.
 
-        A reply can come in two parts with a pause between them, when Furby
+        A reply can come in two parts with a pause between them, when Luna
         calls a tool part-way through ("I'll write that down" ... "done").
         Treating the first pause as the end made the next line start inside
         the second part, where the echo gate cut it. So after each burst has
@@ -227,7 +227,7 @@ async def test_call(clips: dict):
             live = await wait_for(lambda: dash.stats.get("notes_live"), 15)
             check("notetaker connects", live)
             greet = await phone.settle(dash)
-            check("Furby greets the caller", greet > 1.0, f"{greet:.1f}s of audio")
+            check("Luna greets the caller", greet > 1.0, f"{greet:.1f}s of audio")
 
             # --- both streams, two voices
             await phone.speak(clips["milk"]);    r1 = await phone.settle(dash)
@@ -239,7 +239,7 @@ async def test_call(clips: dict):
             milk, dent = find("milk"), find("dentist")
             if not (milk and dent):
                 print("        notes captured:", [f"{n['speaker']}: {n['text']}" for n in dash.notes])
-            check("Furby replies in talk mode", r1 > 0.3 or r2 > 0.3, f"{r1:.1f}s, {r2:.1f}s")
+            check("Luna replies in talk mode", r1 > 0.3 or r2 > 0.3, f"{r1:.1f}s, {r2:.1f}s")
             check("notes capture voice 1", bool(milk), (milk or {}).get("text", "missing")[:52])
             check("notes capture voice 2", bool(dent), (dent or {}).get("text", "missing")[:52])
             if milk and dent:
@@ -254,19 +254,19 @@ async def test_call(clips: dict):
             check("tool call: 'turn the volume up'", rose,
                   f"0.25 -> {dash.stats.get('vol', 0):.2f}")
 
-            # --- notes only: Furby silent, notes still written
+            # --- notes only: Luna silent, notes still written
             await dash.send(cmd="mode", value="notes")
             await wait_for(lambda: dash.stats.get("mode") == "notes", 3)
             n0 = len(dash.notes)
             await phone.speak(clips["quiet"]); quiet = await phone.settle(dash)
             wrote = await wait_for(lambda: len(dash.notes) > n0, 8)
-            check("notes-only mode keeps Furby silent", quiet < 0.3, f"{quiet:.1f}s of audio")
+            check("notes-only mode keeps Luna silent", quiet < 0.3, f"{quiet:.1f}s of audio")
             check("notes-only mode still takes notes", wrote)
 
-            # --- the notetaker hears the name and hands back to Furby
+            # --- the notetaker hears the name and hands back to Luna
             await phone.speak(clips["wake"]); await phone.settle(dash)
             woke = await wait_for(lambda: dash.stats.get("mode") == "talk", 8)
-            check("'Hey Furby' switches back to talk", woke,
+            check("'Hey Luna' switches back to talk", woke,
                   "heard" if woke else "name not recognised - wake word is best-effort")
             phone_task.cancel()
 
@@ -383,7 +383,7 @@ async def main():
     test_firmware()
 
     # memory.md too: test calls say things like "remind me to buy milk", and
-    # Furby's remember tool writes those into the real memory file.
+    # Luna's remember tool writes those into the real memory file.
     logs = snapshot([RELAY / "notes.jsonl", RELAY / "session.jsonl", RELAY / "memory.md"])
     try:
         with tempfile.TemporaryDirectory() as tmp:
